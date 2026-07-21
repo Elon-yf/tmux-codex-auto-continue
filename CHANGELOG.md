@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.1.1 - 2026-07-21
+
+- Recognize the column-zero `■ internal streaming error, please retry` Codex
+  error, including the optional displayed `---` separator suffix.
+- Reuse the verified bracketed-paste plus real-Enter `Continue` submission.
+
 ## v0.1.0 - 2026-07-21
 
 - Detect retryable Codex request errors and model-capacity errors.

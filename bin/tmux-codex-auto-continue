@@ -30,7 +30,7 @@ CAPTURE_HISTORY_LINES = 400
 REPLY = "Continue"
 OPTION_NAME = "@codex-auto-continue"
 EMPTY_COMPOSER_CURSOR_X = 2
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 
 # Requiring Codex's error glyph in column zero avoids matching quoted text in
 # user prompts, assistant messages, shell commands, or captured command output.
@@ -40,6 +40,10 @@ ERROR_RE = re.compile(
 )
 CAPACITY_RE = re.compile(
     r"^⚠ Selected model is at capacity\. Please try a different model\.[ \t]*$",
+    re.MULTILINE,
+)
+STREAMING_ERROR_RE = re.compile(
+    r"^■ internal streaming error, please retry(?:[ \t]+---)?[ \t]*$",
     re.MULTILINE,
 )
 SAFETY_MENU_HEADER_RE = re.compile(
@@ -124,6 +128,9 @@ def event_signatures(text: str) -> list[str]:
 
     for match in CAPACITY_RE.finditer(text):
         matches.append((match.start(), "capacity"))
+
+    for match in STREAMING_ERROR_RE.finditer(text):
+        matches.append((match.start(), "streaming_error"))
 
     matches.sort(key=lambda item: item[0])
     return [signature for _, signature in matches]
@@ -763,9 +770,12 @@ def self_test() -> int:
                 "your request. Please include the request ID "
                 "4031e3df-b388-458c-aa39-38f0fffa8295 in your message."
             ),
+            "■ internal streaming error, please retry",
+            "■ internal streaming error, please retry ---   ",
             (
                 "› quoted: 1. ─ Worked for 15m 36s ────── 2. ■ An error "
-                "occurred while processing your request."
+                "occurred while processing your request. ■ internal streaming "
+                "error, please retry ---"
             ),
             (
                 "⚠ Selected model is at capacity. Please try a different "
@@ -775,6 +785,8 @@ def self_test() -> int:
     )
     expected = [
         "error:4031e3df-b388-458c-aa39-38f0fffa8295",
+        "streaming_error",
+        "streaming_error",
         "capacity",
     ]
     assert event_signatures(sample) == expected
@@ -783,6 +795,7 @@ def self_test() -> int:
         "  ■ An error occurred while processing your request."
     ) == []
     assert event_signatures("─ Worked for 1h 29m 00s ─────") == []
+    assert event_signatures("› ■ internal streaming error, please retry ---") == []
     capacity = "Selected model is at capacity. Please try a different model."
     assert event_signatures(f"⚠ {capacity}") == ["capacity"]
     assert event_signatures(f"⚠ {capacity}\n⚠ {capacity}") == [

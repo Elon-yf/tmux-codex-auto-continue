@@ -10,17 +10,17 @@ accepts Codex's **Keep waiting** safety-buffering choice.
 
 ## Quick install
 
-Pinned one-line installer (v0.1.0):
+Pinned one-line installer (v0.1.1):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.1.0/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.1.1/install.sh | sh
 ```
 
 For an audit-first install, download and inspect the script before running it:
 
 ```sh
 curl -fsSLo /tmp/tmux-codex-install.sh \
-  https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.1.0/install.sh
+  https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.1.1/install.sh
 less /tmp/tmux-codex-install.sh
 sh /tmp/tmux-codex-install.sh
 ```
@@ -35,6 +35,7 @@ idempotent.
 | Codex state | Action |
 | --- | --- |
 | `■ An error occurred while processing ...` | Paste `Continue`, then send a real Enter |
+| `■ internal streaming error, please retry` | Paste `Continue`, then send a real Enter |
 | `⚠ Selected model is at capacity. Please try a different model.` | Paste `Continue`, then send a real Enter |
 | Active `Additional safety checks` menu, Retry selected | Down, verify `Keep waiting`, then Enter |
 | Active menu, `Keep waiting` already selected | Enter only |
@@ -125,11 +126,11 @@ are stored at `~/.cache/tmux-codex-auto-continue.log`. A separate tmux socket
 
 ## Update and uninstall
 
-Re-run the pinned installer after changing `v0.1.0` to a newer release tag.
+Re-run the pinned installer after changing `v0.1.1` to a newer release tag.
 To remove a curl installation:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.1.0/uninstall.sh | sh
+curl -fsSL https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.1.1/uninstall.sh | sh
 ```
 
 The uninstaller disables the option, removes only the marked config block and
