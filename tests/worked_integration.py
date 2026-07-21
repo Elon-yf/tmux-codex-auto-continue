@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -14,6 +15,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 WATCHER = ROOT / "bin" / "tmux-codex-auto-continue"
+SUBMITTED_MARKER = "__CONTINUE_SUBMITTED__"
 
 
 def main() -> int:
@@ -29,6 +31,12 @@ def main() -> int:
     fake_codex.parent.mkdir(parents=True)
     shutil.copy2("/bin/bash", fake_codex)
     fake_codex.chmod(0o755)
+    bash_rc = temporary_root / "bashrc"
+    bash_rc.write_text(
+        "PS1='X '\n"
+        f"Continue() {{ printf '%s\\n' {SUBMITTED_MARKER}; }}\n",
+        encoding="utf-8",
+    )
 
     environment = os.environ.copy()
     environment["XDG_RUNTIME_DIR"] = str(runtime_dir)
@@ -63,9 +71,7 @@ def main() -> int:
             "120",
             "-y",
             "24",
-            "-e",
-            "PS1=X ",
-            f"{fake_codex} --noprofile --norc -i",
+            f"{fake_codex} --noprofile --rcfile {shlex.quote(str(bash_rc))} -i",
         )
         assert created.returncode == 0, created.stderr
         enabled = tmux("set-option", "-g", "@codex-auto-continue", "on")
@@ -85,7 +91,7 @@ def main() -> int:
         # Completion continuation is a separate explicit opt-in.
         send_line("printf '%s\\n' '─ Worked for 0m 01s ───────────────'")
         time.sleep(2.5)
-        assert capture().count("Continue: command not found") == 0
+        assert capture().count(SUBMITTED_MARKER) == 0, capture()
         worked_enabled = tmux(
             "set-option", "-g", "@codex-auto-continue-worked", "on"
         )
@@ -94,14 +100,14 @@ def main() -> int:
         send_line("printf '%s\\n' '─ Worked for 10m 56s ───────────────'")
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            if "Continue: command not found" in capture():
+            if SUBMITTED_MARKER in capture():
                 break
             time.sleep(0.25)
-        assert capture().count("Continue: command not found") == 1
+        assert capture().count(SUBMITTED_MARKER) == 1, capture()
 
         send_line("printf '%s\\n' '› ─ Worked for 10m 56s ───────────────'")
         time.sleep(2.5)
-        assert capture().count("Continue: command not found") == 1
+        assert capture().count(SUBMITTED_MARKER) == 1, capture()
 
         restarted = subprocess.run(
             ["python3", str(WATCHER), "--socket", socket, "--restart"],
