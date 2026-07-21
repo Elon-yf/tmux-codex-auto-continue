@@ -22,11 +22,16 @@ jobs:
         run: |
           python -m pip install ruff
           sudo apt-get update
-          sudo apt-get install -y shellcheck
+          sudo apt-get install -y shellcheck tmux
       - name: Python checks
         run: |
           python bin/tmux-codex-auto-continue --self-test
+          python tests/worked_integration.py
           python -m py_compile bin/tmux-codex-auto-continue
+          python -m py_compile tests/worked_integration.py
           ruff check bin/tmux-codex-auto-continue
+          ruff check tests/worked_integration.py
+          test "$(sed -n 's/^VERSION=//p' install.sh)" = "v$(python bin/tmux-codex-auto-continue --version)"
+          printf '%s  %s\n' "$(sed -n 's/^WATCHER_SHA256=//p' install.sh)" bin/tmux-codex-auto-continue | sha256sum --check --status
       - name: Shell checks
         run: shellcheck install.sh uninstall.sh tmux-codex-auto-continue.tmux

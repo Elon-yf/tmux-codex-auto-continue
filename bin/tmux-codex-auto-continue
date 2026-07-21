@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Recover selected retryable Codex errors and waiting prompts.
+"""Continue completed Codex turns and recover selected retry/wait states.
 
 The watcher is scoped to one tmux server and discovers its panes dynamically.
 It only sends input when the foreground process group is a Codex CLI process.
@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 import re
 import shlex
+import signal
 import subprocess
 import sys
 import time
@@ -26,14 +27,16 @@ MIN_SEND_GAP_SECONDS = 2.0
 MIN_MENU_ATTEMPT_GAP_SECONDS = 2.0
 MENU_REDRAW_TIMEOUT_SECONDS = 0.75
 MENU_REDRAW_POLL_SECONDS = 0.05
+DAEMON_RESTART_TIMEOUT_SECONDS = 3.0
 CAPTURE_HISTORY_LINES = 400
 REPLY = "Continue"
 OPTION_NAME = "@codex-auto-continue"
+WORKED_OPTION_NAME = "@codex-auto-continue-worked"
 EMPTY_COMPOSER_CURSOR_X = 2
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 
-# Requiring Codex's error glyph in column zero avoids matching quoted text in
-# user prompts, assistant messages, shell commands, or captured command output.
+# Requiring Codex's exact event glyph and structure in column zero avoids
+# matching quoted text in user prompts, assistant messages, or shell output.
 ERROR_RE = re.compile(
     r"^■ An error occurred while processing\b[^\n]*$",
     re.MULTILINE,
@@ -44,6 +47,10 @@ CAPACITY_RE = re.compile(
 )
 STREAMING_ERROR_RE = re.compile(
     r"^■ internal streaming error, please retry(?:[ \t]+---)?[ \t]*$",
+    re.MULTILINE,
+)
+WORKED_RE = re.compile(
+    r"^─ Worked for (?:\d+h )?\d+m \d+s +─+[ \t]*$",
     re.MULTILINE,
 )
 SAFETY_MENU_HEADER_RE = re.compile(
@@ -131,6 +138,9 @@ def event_signatures(text: str) -> list[str]:
 
     for match in STREAMING_ERROR_RE.finditer(text):
         matches.append((match.start(), "streaming_error"))
+
+    for match in WORKED_RE.finditer(text):
+        matches.append((match.start(), "worked"))
 
     matches.sort(key=lambda item: item[0])
     return [signature for _, signature in matches]
@@ -419,10 +429,18 @@ def capture_safety_menu_selection(socket: str, pane: str) -> str | None:
     return safety_menu_selection(result.stdout)
 
 
-def option_enabled(socket: str) -> bool:
-    result = run_tmux(socket, "show-options", "-gqv", OPTION_NAME)
+def tmux_option_enabled(socket: str, option_name: str) -> bool:
+    result = run_tmux(socket, "show-options", "-gqv", option_name)
     value = result.stdout.strip().lower()
     return result.returncode == 0 and value in {"1", "on", "true", "yes"}
+
+
+def option_enabled(socket: str) -> bool:
+    return tmux_option_enabled(socket, OPTION_NAME)
+
+
+def worked_option_enabled(socket: str) -> bool:
+    return tmux_option_enabled(socket, WORKED_OPTION_NAME)
 
 
 def send_continue(
@@ -612,6 +630,7 @@ def run_daemon(socket: str) -> int:
 
         now = time.monotonic()
         enabled = option_enabled(socket)
+        worked_enabled = worked_option_enabled(socket)
         seen_panes: set[str] = set()
 
         for pane, pane_pid, session, in_mode, geometry in panes:
@@ -686,10 +705,15 @@ def run_daemon(socket: str) -> int:
                         )
                 continue
 
-            if new_events:
+            actionable_events = [
+                event
+                for event in new_events
+                if event != "worked" or worked_enabled
+            ]
+            if actionable_events:
                 state.pending = True
                 state.pending_kinds.update(
-                    event.partition(":")[0] for event in new_events
+                    event.partition(":")[0] for event in actionable_events
                 )
                 state.send_after = max(
                     now + SETTLE_SECONDS,
@@ -713,6 +737,14 @@ def run_daemon(socket: str) -> int:
                 state.pending = False
                 state.pending_kinds.clear()
                 continue
+            if (
+                "worked" in state.pending_kinds
+                and not worked_option_enabled(socket)
+            ):
+                state.pending_kinds.discard("worked")
+                if not state.pending_kinds:
+                    state.pending = False
+                    continue
 
             kinds = ",".join(sorted(state.pending_kinds))
             if send_continue(socket, pane, pane_pid, process_identity):
@@ -744,11 +776,56 @@ def toggle(socket: str) -> int:
     return 0
 
 
+def restart_daemon(socket: str) -> int:
+    """Replace only this socket's verified watcher process."""
+
+    previous_pid = daemon_pid(socket)
+    if previous_pid is not None:
+        try:
+            os.kill(previous_pid, signal.SIGTERM)
+        except ProcessLookupError:
+            previous_pid = None
+        except PermissionError as error:
+            print(f"failed to stop watcher {previous_pid}: {error}", file=sys.stderr)
+            return 1
+
+        deadline = time.monotonic() + DAEMON_RESTART_TIMEOUT_SECONDS
+        while time.monotonic() < deadline:
+            current_pid = daemon_pid(socket)
+            if current_pid is None or current_pid != previous_pid:
+                break
+            time.sleep(0.05)
+        else:
+            print(
+                f"watcher {previous_pid} did not stop after SIGTERM",
+                file=sys.stderr,
+            )
+            return 1
+
+    if not option_enabled(socket):
+        return 0
+    if not start_daemon(socket):
+        print("failed to restart auto-continue watcher", file=sys.stderr)
+        return 1
+
+    deadline = time.monotonic() + DAEMON_RESTART_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        current_pid = daemon_pid(socket)
+        if current_pid is not None and current_pid != previous_pid:
+            return 0
+        time.sleep(0.05)
+    print("replacement watcher did not start", file=sys.stderr)
+    return 1
+
+
 def show_status(socket: str) -> int:
     enabled = "on" if option_enabled(socket) else "off"
+    worked = "on" if worked_option_enabled(socket) else "off"
     pid = daemon_pid(socket)
     daemon = str(pid) if pid is not None else "not running"
-    print(f"enabled={enabled} daemon={daemon} socket={socket}")
+    print(
+        f"enabled={enabled} worked={worked} daemon={daemon} socket={socket}"
+    )
 
     panes = list_panes(socket)
     if panes is None:
@@ -784,6 +861,7 @@ def self_test() -> int:
         ]
     )
     expected = [
+        "worked",
         "error:4031e3df-b388-458c-aa39-38f0fffa8295",
         "streaming_error",
         "streaming_error",
@@ -794,7 +872,11 @@ def self_test() -> int:
         "  ─ Worked for 15m 36s ─────\n"
         "  ■ An error occurred while processing your request."
     ) == []
-    assert event_signatures("─ Worked for 1h 29m 00s ─────") == []
+    assert event_signatures("─ Worked for 1h 29m 00s ─────") == ["worked"]
+    assert event_signatures("─ Worked for 10m 56s ───────────────") == [
+        "worked"
+    ]
+    assert event_signatures("› ─ Worked for 10m 56s ───────────────") == []
     assert event_signatures("› ■ internal streaming error, please retry ---") == []
     capacity = "Selected model is at capacity. Please try a different model."
     assert event_signatures(f"⚠ {capacity}") == ["capacity"]
@@ -878,6 +960,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--socket", help="tmux socket path")
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument("--toggle", action="store_true")
+    actions.add_argument("--restart", action="store_true")
     actions.add_argument("--status", action="store_true")
     actions.add_argument("--self-test", action="store_true")
     return parser.parse_args()
@@ -895,6 +978,8 @@ def main() -> int:
         return 2
     if args.toggle:
         return toggle(args.socket)
+    if args.restart:
+        return restart_daemon(args.socket)
     if args.status:
         return show_status(args.socket)
     return run_daemon(args.socket)

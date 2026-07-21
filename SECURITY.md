@@ -10,6 +10,10 @@ repository. Include the Codex version, tmux version, terminal width/height, the
 rendered prompt structure, and whether copy mode was active. Do not include
 credentials, request contents, or other private pane output.
 
-The supported surface for v0.1.1 is Linux, Python 3.10+, an English Codex UI,
+The supported surface for v0.1.2 is Linux, Python 3.10+, an English Codex UI,
 and the npm `@openai/codex` native binary layout. Unsupported environments fail
 closed or are ignored.
+
+`@codex-auto-continue-worked` is an explicit opt-in because each completed
+turn can trigger another `Continue`, intentionally extending the session and
+potentially consuming additional time or tokens.
