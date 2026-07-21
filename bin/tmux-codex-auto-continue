@@ -1,0 +1,894 @@
+#!/usr/bin/env python3
+"""Recover selected retryable Codex errors and waiting prompts.
+
+The watcher is scoped to one tmux server and discovers its panes dynamically.
+It only sends input when the foreground process group is a Codex CLI process.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+
+POLL_INTERVAL_SECONDS = 0.5
+SETTLE_SECONDS = 1.5
+MIN_SEND_GAP_SECONDS = 2.0
+MIN_MENU_ATTEMPT_GAP_SECONDS = 2.0
+MENU_REDRAW_TIMEOUT_SECONDS = 0.75
+MENU_REDRAW_POLL_SECONDS = 0.05
+CAPTURE_HISTORY_LINES = 400
+REPLY = "Continue"
+OPTION_NAME = "@codex-auto-continue"
+EMPTY_COMPOSER_CURSOR_X = 2
+VERSION = "0.1.0"
+
+# Requiring Codex's error glyph in column zero avoids matching quoted text in
+# user prompts, assistant messages, shell commands, or captured command output.
+ERROR_RE = re.compile(
+    r"^■ An error occurred while processing\b[^\n]*$",
+    re.MULTILINE,
+)
+CAPACITY_RE = re.compile(
+    r"^⚠ Selected model is at capacity\. Please try a different model\.[ \t]*$",
+    re.MULTILINE,
+)
+SAFETY_MENU_HEADER_RE = re.compile(
+    r"^  Additional safety checks[ \t]*$",
+)
+SAFETY_MENU_ITEM_RE = re.compile(
+    r"^(?P<cursor>[› ]) (?P<number>[1-3])\. "
+    r"(?P<label>Retry with a faster model|Keep waiting|Learn more)[ \t]*$",
+)
+SAFETY_MENU_FOOTER = "  Press enter to confirm or esc to go back"
+SAFETY_MESSAGE_WITH_RETRY = (
+    "This request requires additional safety checks, which can take extra "
+    "time. Hang tight or retry with a faster model for a quicker response, "
+    "though it may be less capable of handling complex requests."
+)
+SAFETY_MESSAGE_WITHOUT_RETRY = (
+    "This request requires additional safety checks, which can take extra time."
+)
+SAFETY_MENU_WITH_RETRY = (
+    "Retry with a faster model",
+    "Keep waiting",
+    "Learn more",
+)
+SAFETY_MENU_WITHOUT_RETRY = ("Keep waiting", "Learn more")
+REQUEST_ID_RE = re.compile(
+    r"\brequest ID\s+"
+    r"(?P<request_id>[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{12})\b",
+    re.IGNORECASE,
+)
+
+
+@dataclass
+class PaneState:
+    process_identity: str
+    events: list[str]
+    geometry: tuple[int, int]
+    pending: bool = False
+    pending_kinds: set[str] = field(default_factory=set)
+    send_after: float = 0.0
+    last_sent: float = 0.0
+    last_menu_attempt: float = 0.0
+    safety_menu_latched: bool = False
+    safety_menu_absent_polls: int = 0
+
+
+def run_tmux(socket: str, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["tmux", "-S", socket, *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+
+
+def log(message: str) -> None:
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"{timestamp} {message}", flush=True)
+
+
+def event_signatures(text: str) -> list[str]:
+    """Return ordered, normalized matches from a captured pane."""
+
+    matches: list[tuple[int, str]] = []
+
+    for match in ERROR_RE.finditer(text):
+        # Codex manually wraps this message on narrow panes, so search its
+        # indented continuation block rather than only the first grid line.
+        tail_lines = text[match.start() :].splitlines()
+        block_lines = [tail_lines[0]]
+        for line in tail_lines[1:16]:
+            if not line.strip() or re.match(r"^[■─›•] ", line):
+                break
+            block_lines.append(line)
+        request_id = REQUEST_ID_RE.search("\n".join(block_lines))
+        identity = (
+            request_id.group("request_id").lower() if request_id else "unknown"
+        )
+        matches.append((match.start(), f"error:{identity}"))
+
+    for match in CAPACITY_RE.finditer(text):
+        matches.append((match.start(), "capacity"))
+
+    matches.sort(key=lambda item: item[0])
+    return [signature for _, signature in matches]
+
+
+def safety_menu_selection(text: str) -> str | None:
+    """Return the selected row of a complete, currently rendered safety menu."""
+
+    lines = text.splitlines()
+    selection_names = {
+        "Retry with a faster model": "retry",
+        "Keep waiting": "wait",
+        "Learn more": "learn",
+    }
+
+    for header_index, header in enumerate(lines):
+        if SAFETY_MENU_HEADER_RE.fullmatch(header) is None:
+            continue
+
+        item_search_end = min(header_index + 14, len(lines))
+        for first_item_index in range(header_index + 1, item_search_end):
+            if SAFETY_MENU_ITEM_RE.fullmatch(lines[first_item_index]) is None:
+                continue
+
+            items: list[re.Match[str]] = []
+            item_index = first_item_index
+            while item_index < len(lines):
+                item = SAFETY_MENU_ITEM_RE.fullmatch(lines[item_index])
+                if item is None:
+                    break
+                items.append(item)
+                item_index += 1
+
+            labels = tuple(item.group("label") for item in items)
+            if labels == SAFETY_MENU_WITH_RETRY:
+                expected_message = SAFETY_MESSAGE_WITH_RETRY
+            elif labels == SAFETY_MENU_WITHOUT_RETRY:
+                expected_message = SAFETY_MESSAGE_WITHOUT_RETRY
+            else:
+                continue
+
+            numbers = tuple(int(item.group("number")) for item in items)
+            if numbers != tuple(range(1, len(items) + 1)):
+                continue
+
+            message = " ".join(
+                line.strip()
+                for line in lines[header_index + 1 : first_item_index]
+                if line.strip()
+            )
+            if message != expected_message:
+                continue
+
+            footer_indices = [
+                index
+                for index, line in enumerate(lines[item_index:], start=item_index)
+                if line.rstrip() == SAFETY_MENU_FOOTER
+            ]
+            if not footer_indices:
+                continue
+            footer_index = footer_indices[0]
+            # The selection view owns the bottom of the current viewport. A
+            # trailing non-empty line means this is likely quoted scrollback,
+            # not an active menu, so never inject keys.
+            if any(line.strip() for line in lines[footer_index + 1 :]):
+                continue
+
+            selected = [
+                item.group("label")
+                for item in items
+                if item.group("cursor") == "›"
+            ]
+            if len(selected) == 1:
+                return selection_names[selected[0]]
+
+    return None
+
+
+def appended_events(previous: list[str], current: list[str]) -> list[str]:
+    """Find events appended to a rolling history window.
+
+    The overlap calculation keeps working when tmux drops old scrollback lines.
+    """
+
+    maximum = min(len(previous), len(current))
+    for overlap in range(maximum, -1, -1):
+        if overlap == 0 or previous[-overlap:] == current[:overlap]:
+            return current[overlap:]
+    return current
+
+
+def read_proc_stat(pid: int) -> tuple[int, int, str] | None:
+    """Return (process group, foreground process group, start time)."""
+
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+        fields = raw[raw.rfind(")") + 2 :].split()
+        return int(fields[2]), int(fields[5]), fields[19]
+    except (IndexError, OSError, ValueError):
+        return None
+
+
+def process_children(pid: int) -> set[int]:
+    """Return children created by any thread in a process."""
+
+    children: set[int] = set()
+    try:
+        files = Path(f"/proc/{pid}/task").glob("*/children")
+        for children_file in files:
+            for child in children_file.read_text().split():
+                children.add(int(child))
+    except (OSError, ValueError):
+        pass
+    return children
+
+
+def installed_codex_executable(pid: int) -> Path | None:
+    try:
+        target = os.readlink(f"/proc/{pid}/exe")
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return None
+    executable = Path(target.removesuffix(" (deleted)"))
+    path = str(executable)
+    package_marker = f"{os.sep}@openai{os.sep}codex{os.sep}"
+    vendor_marker = f"{os.sep}vendor{os.sep}"
+    if (
+        executable.name == "codex"
+        and package_marker in path
+        and vendor_marker in path
+    ):
+        return executable
+    return None
+
+
+def native_codex_in_process_group(
+    root_pid: int, process_group: int
+) -> tuple[int, str] | None:
+    """Find the native Codex executable below the foreground group leader."""
+
+    queue = [root_pid]
+    visited: set[int] = set()
+
+    while queue and len(visited) < 256:
+        pid = queue.pop(0)
+        if pid in visited:
+            continue
+        visited.add(pid)
+
+        stat = read_proc_stat(pid)
+        if (
+            stat is not None
+            and stat[0] == process_group
+            and installed_codex_executable(pid) is not None
+        ):
+            return pid, stat[2]
+
+        queue.extend(process_children(pid) - visited)
+
+    return None
+
+
+def codex_process_identity(pane_pid: int) -> str | None:
+    """Identify Codex through the pane's actual foreground process group."""
+
+    pane_stat = read_proc_stat(pane_pid)
+    if pane_stat is None:
+        return None
+
+    foreground_pgid = pane_stat[1]
+    if foreground_pgid <= 0:
+        return None
+
+    foreground_stat = read_proc_stat(foreground_pgid)
+    if foreground_stat is None:
+        return None
+
+    native_codex = native_codex_in_process_group(
+        foreground_pgid, foreground_pgid
+    )
+    if native_codex is None:
+        return None
+
+    # The foreground group may change while /proc is being traversed.
+    final_pane_stat = read_proc_stat(pane_pid)
+    if final_pane_stat is None or final_pane_stat[1] != foreground_pgid:
+        return None
+
+    native_pid, native_start_time = native_codex
+    return (
+        f"{foreground_pgid}:{foreground_stat[2]}:"
+        f"{native_pid}:{native_start_time}"
+    )
+
+
+def list_panes(
+    socket: str,
+) -> list[tuple[str, int, str, bool, tuple[int, int]]] | None:
+    result = run_tmux(
+        socket,
+        "list-panes",
+        "-a",
+        "-F",
+        (
+            "#{pane_id}|#{pane_pid}|#{pane_dead}|#{pane_in_mode}|"
+            "#{pane_width}|#{pane_height}|#{session_name}"
+        ),
+    )
+    if result.returncode != 0:
+        return None
+
+    panes: list[tuple[str, int, str, bool, tuple[int, int]]] = []
+    for line in result.stdout.splitlines():
+        parts = line.split("|", 6)
+        if len(parts) != 7 or parts[2] == "1":
+            continue
+        try:
+            pane_pid = int(parts[1])
+            geometry = (int(parts[4]), int(parts[5]))
+        except ValueError:
+            continue
+        panes.append((parts[0], pane_pid, parts[6], parts[3] == "1", geometry))
+    return panes
+
+
+def pane_is_in_mode(socket: str, pane: str) -> bool:
+    result = run_tmux(
+        socket,
+        "display-message",
+        "-p",
+        "-t",
+        pane,
+        "#{pane_in_mode}",
+    )
+    return result.returncode != 0 or result.stdout.strip() == "1"
+
+
+def pane_cursor_x(socket: str, pane: str) -> int | None:
+    result = run_tmux(
+        socket,
+        "display-message",
+        "-p",
+        "-t",
+        pane,
+        "#{cursor_x}|#{pane_in_mode}",
+    )
+    if result.returncode != 0:
+        return None
+    parts = result.stdout.strip().split("|", 1)
+    if len(parts) != 2 or parts[1] != "0":
+        return None
+    try:
+        return int(parts[0])
+    except ValueError:
+        return None
+
+
+def capture_events(socket: str, pane: str) -> list[str] | None:
+    result = run_tmux(
+        socket,
+        "capture-pane",
+        "-p",
+        "-J",
+        "-S",
+        f"-{CAPTURE_HISTORY_LINES}",
+        "-t",
+        pane,
+    )
+    if result.returncode != 0:
+        return None
+    return event_signatures(result.stdout)
+
+
+def capture_safety_menu_selection(socket: str, pane: str) -> str | None:
+    """Inspect only the visible grid so stale scrollback cannot trigger keys."""
+
+    result = run_tmux(
+        socket,
+        "capture-pane",
+        "-p",
+        "-J",
+        "-t",
+        pane,
+    )
+    if result.returncode != 0:
+        return None
+    return safety_menu_selection(result.stdout)
+
+
+def option_enabled(socket: str) -> bool:
+    result = run_tmux(socket, "show-options", "-gqv", OPTION_NAME)
+    value = result.stdout.strip().lower()
+    return result.returncode == 0 and value in {"1", "on", "true", "yes"}
+
+
+def send_continue(
+    socket: str,
+    pane: str,
+    pane_pid: int,
+    process_identity: str,
+) -> bool:
+    """Paste the reply explicitly, then submit it with a real Enter key.
+
+    Codex treats a rapid sequence of ordinary character key events as a paste
+    burst. If Enter arrives during that burst, it inserts a newline instead of
+    submitting. tmux bracketed paste reaches Codex as an explicit paste event,
+    which clears that suppression state before the real Enter key is sent. The
+    three tmux commands are queued together server-side to preserve ordering.
+    """
+
+    if pane_cursor_x(socket, pane) != EMPTY_COMPOSER_CURSOR_X:
+        log(f"skipped pane {pane}: composer is not empty or not ready")
+        return False
+
+    buffer_name = f"codex-auto-continue-{os.getpid()}-{pane.lstrip('%')}"
+    if codex_process_identity(pane_pid) != process_identity:
+        log(f"skipped pane {pane}: Codex foreground process changed")
+        return False
+    if pane_is_in_mode(socket, pane) or not option_enabled(socket):
+        log(f"skipped pane {pane}: pane mode or option changed")
+        return False
+    if capture_safety_menu_selection(socket, pane) is not None:
+        log(f"skipped pane {pane}: safety menu owns the keyboard")
+        return False
+
+    submitted = run_tmux(
+        socket,
+        "set-buffer",
+        "-b",
+        buffer_name,
+        "--",
+        REPLY,
+        ";",
+        "paste-buffer",
+        "-p",
+        "-d",
+        "-b",
+        buffer_name,
+        "-t",
+        pane,
+        ";",
+        "send-keys",
+        "-t",
+        pane,
+        "Enter",
+    )
+    if submitted.returncode != 0:
+        log(f"failed to submit reply to pane {pane}: {submitted.stderr.strip()}")
+        return False
+    return True
+
+
+def choose_keep_waiting(
+    socket: str,
+    pane: str,
+    pane_pid: int,
+    process_identity: str,
+) -> bool:
+    """Move from Retry to Keep waiting, verify the row, then press Enter."""
+
+    if codex_process_identity(pane_pid) != process_identity:
+        log(f"skipped pane {pane}: Codex foreground process changed")
+        return False
+    if pane_is_in_mode(socket, pane) or not option_enabled(socket):
+        log(f"skipped pane {pane}: pane mode or option changed")
+        return False
+
+    selection = capture_safety_menu_selection(socket, pane)
+    if selection == "retry":
+        moved = run_tmux(socket, "send-keys", "-t", pane, "Down")
+        if moved.returncode != 0:
+            log(f"failed to select Keep waiting in pane {pane}")
+            return False
+
+        deadline = time.monotonic() + MENU_REDRAW_TIMEOUT_SECONDS
+        selection = None
+        while time.monotonic() < deadline:
+            time.sleep(MENU_REDRAW_POLL_SECONDS)
+            if codex_process_identity(pane_pid) != process_identity:
+                return False
+            if pane_is_in_mode(socket, pane) or not option_enabled(socket):
+                return False
+            selection = capture_safety_menu_selection(socket, pane)
+            if selection == "wait":
+                break
+            if selection == "learn":
+                log(f"aborted pane {pane}: safety-menu selection moved past wait")
+                return False
+
+    if selection != "wait":
+        return False
+
+    # Recheck immediately before Enter so a concurrent key press cannot turn a
+    # stale observation into accepting Retry or Learn more.
+    if codex_process_identity(pane_pid) != process_identity:
+        return False
+    if pane_is_in_mode(socket, pane) or not option_enabled(socket):
+        return False
+    if capture_safety_menu_selection(socket, pane) != "wait":
+        log(f"aborted pane {pane}: Keep waiting is no longer selected")
+        return False
+
+    accepted = run_tmux(socket, "send-keys", "-t", pane, "Enter")
+    if accepted.returncode != 0:
+        log(f"failed to accept Keep waiting in pane {pane}")
+        return False
+    return True
+
+
+def lock_path(socket: str) -> Path:
+    runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+    digest = hashlib.sha256(socket.encode()).hexdigest()[:12]
+    return Path(runtime_dir) / (
+        f"tmux-codex-auto-continue-{os.getuid()}-{digest}.lock"
+    )
+
+
+def acquire_daemon_lock(socket: str) -> int | None:
+    path = lock_path(socket)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(descriptor)
+        return None
+
+    os.ftruncate(descriptor, 0)
+    os.write(descriptor, f"{os.getpid()}\n".encode())
+    return descriptor
+
+
+def daemon_pid(socket: str) -> int | None:
+    try:
+        pid = int(lock_path(socket).read_text().strip())
+        os.kill(pid, 0)
+        argv = [
+            item.decode("utf-8", errors="replace")
+            for item in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+            if item
+        ]
+        if str(Path(__file__).resolve()) not in argv or socket not in argv:
+            return None
+        return pid
+    except (OSError, ValueError):
+        return None
+
+
+def start_daemon(socket: str) -> bool:
+    if daemon_pid(socket) is not None:
+        return True
+    script = str(Path(__file__).resolve())
+    log_path = Path.home() / ".cache/tmux-codex-auto-continue.log"
+    log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    command = (
+        f"umask 077; {shlex.quote(sys.executable)} {shlex.quote(script)} "
+        f"--socket {shlex.quote(socket)} >> {shlex.quote(str(log_path))} 2>&1"
+    )
+    result = run_tmux(socket, "run-shell", "-b", command)
+    return result.returncode == 0
+
+
+def run_daemon(socket: str) -> int:
+    lock_descriptor = acquire_daemon_lock(socket)
+    if lock_descriptor is None:
+        return 0
+
+    # Keep the descriptor alive for the lifetime of the daemon.
+    _ = lock_descriptor
+    states: dict[str, PaneState] = {}
+    log(f"watching tmux server {socket}")
+
+    while True:
+        panes = list_panes(socket)
+        if panes is None:
+            log("tmux server is no longer available; exiting")
+            return 0
+
+        now = time.monotonic()
+        enabled = option_enabled(socket)
+        seen_panes: set[str] = set()
+
+        for pane, pane_pid, session, in_mode, geometry in panes:
+            seen_panes.add(pane)
+            process_identity = codex_process_identity(pane_pid)
+            if process_identity is None:
+                states.pop(pane, None)
+                continue
+
+            events = capture_events(socket, pane)
+            if events is None:
+                states.pop(pane, None)
+                continue
+
+            state = states.get(pane)
+            if state is None or state.process_identity != process_identity:
+                states[pane] = PaneState(process_identity, events, geometry)
+                log(f"baselined Codex pane {pane} in session {session}")
+                continue
+
+            if state.geometry != geometry:
+                state.events = events
+                state.geometry = geometry
+                state.pending = False
+                state.pending_kinds.clear()
+                log(f"rebaselined resized Codex pane {pane} in session {session}")
+                continue
+
+            new_events = appended_events(state.events, events)
+            state.events = events
+
+            menu_selection = capture_safety_menu_selection(socket, pane)
+            if menu_selection is None:
+                state.safety_menu_absent_polls += 1
+                if state.safety_menu_absent_polls >= 2:
+                    state.safety_menu_latched = False
+            else:
+                state.safety_menu_absent_polls = 0
+
+            # Events seen in copy mode or while disabled are baselined and
+            # intentionally not replayed later.
+            if in_mode or not enabled:
+                if menu_selection is not None:
+                    state.safety_menu_latched = True
+                state.pending = False
+                state.pending_kinds.clear()
+                continue
+
+            if menu_selection is not None:
+                # A live selection view owns the keyboard; never fall through
+                # to composer-oriented error recovery while it is visible.
+                state.pending = False
+                state.pending_kinds.clear()
+                if (
+                    menu_selection in {"retry", "wait"}
+                    and not state.safety_menu_latched
+                    and now
+                    >= state.last_menu_attempt + MIN_MENU_ATTEMPT_GAP_SECONDS
+                ):
+                    state.last_menu_attempt = now
+                    if choose_keep_waiting(
+                        socket,
+                        pane,
+                        pane_pid,
+                        process_identity,
+                    ):
+                        state.safety_menu_latched = True
+                        state.last_sent = time.monotonic()
+                        log(
+                            f"accepted Keep waiting in pane {pane} "
+                            f"({session})"
+                        )
+                continue
+
+            if new_events:
+                state.pending = True
+                state.pending_kinds.update(
+                    event.partition(":")[0] for event in new_events
+                )
+                state.send_after = max(
+                    now + SETTLE_SECONDS,
+                    state.last_sent + MIN_SEND_GAP_SECONDS,
+                )
+
+            if not state.pending or now < state.send_after:
+                continue
+
+            # Never inject keys into copy mode or another tmux pane mode.
+            if in_mode or pane_is_in_mode(socket, pane):
+                state.pending = False
+                state.pending_kinds.clear()
+                continue
+
+            # Recheck the process immediately before injecting input.
+            if codex_process_identity(pane_pid) != process_identity:
+                states.pop(pane, None)
+                continue
+            if not option_enabled(socket):
+                state.pending = False
+                state.pending_kinds.clear()
+                continue
+
+            kinds = ",".join(sorted(state.pending_kinds))
+            if send_continue(socket, pane, pane_pid, process_identity):
+                state.last_sent = time.monotonic()
+                log(f"sent Continue to pane {pane} ({session}); event={kinds}")
+            state.pending = False
+            state.pending_kinds.clear()
+
+        for pane in set(states) - seen_panes:
+            states.pop(pane, None)
+
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+
+def toggle(socket: str) -> int:
+    new_value = "off" if option_enabled(socket) else "on"
+    result = run_tmux(socket, "set-option", "-g", OPTION_NAME, new_value)
+    if result.returncode != 0:
+        print(result.stderr.strip(), file=sys.stderr)
+        return 1
+    if new_value == "on" and not start_daemon(socket):
+        print("failed to start auto-continue watcher", file=sys.stderr)
+        return 1
+    run_tmux(
+        socket,
+        "display-message",
+        f"Codex auto-continue: {new_value.upper()}",
+    )
+    return 0
+
+
+def show_status(socket: str) -> int:
+    enabled = "on" if option_enabled(socket) else "off"
+    pid = daemon_pid(socket)
+    daemon = str(pid) if pid is not None else "not running"
+    print(f"enabled={enabled} daemon={daemon} socket={socket}")
+
+    panes = list_panes(socket)
+    if panes is None:
+        print("tmux server is unavailable", file=sys.stderr)
+        return 1
+    for pane, pane_pid, session, in_mode, _geometry in panes:
+        if codex_process_identity(pane_pid) is not None:
+            mode = "copy" if in_mode else "normal"
+            print(f"codex-pane={pane} session={session} mode={mode}")
+    return 0
+
+
+def self_test() -> int:
+    sample = "\n".join(
+        [
+            "─ Worked for 15m 36s ─────────────────────────",
+            (
+                "■ An error occurred while processing your request. You can retry "
+                "your request. Please include the request ID "
+                "4031e3df-b388-458c-aa39-38f0fffa8295 in your message."
+            ),
+            (
+                "› quoted: 1. ─ Worked for 15m 36s ────── 2. ■ An error "
+                "occurred while processing your request."
+            ),
+            (
+                "⚠ Selected model is at capacity. Please try a different "
+                "model.   "
+            ),
+        ]
+    )
+    expected = [
+        "error:4031e3df-b388-458c-aa39-38f0fffa8295",
+        "capacity",
+    ]
+    assert event_signatures(sample) == expected
+    assert event_signatures(
+        "  ─ Worked for 15m 36s ─────\n"
+        "  ■ An error occurred while processing your request."
+    ) == []
+    assert event_signatures("─ Worked for 1h 29m 00s ─────") == []
+    capacity = "Selected model is at capacity. Please try a different model."
+    assert event_signatures(f"⚠ {capacity}") == ["capacity"]
+    assert event_signatures(f"⚠ {capacity}\n⚠ {capacity}") == [
+        "capacity",
+        "capacity",
+    ]
+    for quoted_capacity in (
+        capacity,
+        f"› {capacity}",
+        f"• {capacity}",
+        f"  ⚠ {capacity}",
+    ):
+        assert event_signatures(quoted_capacity) == []
+    assert event_signatures(
+        "■ An error occurred while processing\n"
+        "  your request. Please include the request ID\n"
+        "  4031e3df-b388-458c-aa39-38f0fffa8295 in your message."
+    ) == ["error:4031e3df-b388-458c-aa39-38f0fffa8295"]
+
+    safety_popup = "\n".join(
+        [
+            "  Additional safety checks",
+            "  This request requires additional safety checks, which can take",
+            "  extra time. Hang tight or retry with a faster model for a quicker",
+            "  response, though it may be less capable of handling complex requests.",
+            "",
+            "› 1. Retry with a faster model",
+            "  2. Keep waiting",
+            "  3. Learn more",
+            "",
+            "  Press enter to confirm or esc to go back",
+        ]
+    )
+    assert safety_menu_selection(safety_popup) == "retry"
+    selected_wait = safety_popup.replace(
+        "› 1. Retry with a faster model\n  2. Keep waiting",
+        "  1. Retry with a faster model\n› 2. Keep waiting",
+    )
+    assert safety_menu_selection(selected_wait) == "wait"
+    selected_learn = selected_wait.replace(
+        "› 2. Keep waiting\n  3. Learn more",
+        "  2. Keep waiting\n› 3. Learn more",
+    )
+    assert safety_menu_selection(selected_learn) == "learn"
+    no_retry_popup = "\n".join(
+        [
+            "  Additional safety checks",
+            "  This request requires additional safety checks, which can take",
+            "  extra time.",
+            "",
+            "› 1. Keep waiting",
+            "  2. Learn more",
+            "",
+            "  Press enter to confirm or esc to go back",
+        ]
+    )
+    assert safety_menu_selection(no_retry_popup) == "wait"
+    assert safety_menu_selection(safety_popup.replace("  Press enter", "  Hit enter")) is None
+    assert safety_menu_selection(safety_popup + "\n  quoted after popup") is None
+    quoted_popup = safety_popup.replace(
+        "  Additional safety checks",
+        "› Additional safety checks",
+    )
+    assert safety_menu_selection(quoted_popup) is None
+
+    first_error = "error:4031e3df-b388-458c-aa39-38f0fffa8295"
+    second_error = "error:5031e3df-b388-458c-aa39-38f0fffa8295"
+    assert appended_events([first_error], [first_error]) == []
+    assert appended_events(
+        [first_error],
+        [first_error, second_error],
+    ) == [second_error]
+    print("self-test: PASS")
+    return 0
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version=VERSION)
+    parser.add_argument("--socket", help="tmux socket path")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--toggle", action="store_true")
+    actions.add_argument("--status", action="store_true")
+    actions.add_argument("--self-test", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if not Path("/proc/self/stat").is_file():
+        print("Linux with a mounted /proc filesystem is required", file=sys.stderr)
+        return 1
+    if args.self_test:
+        return self_test()
+    if not args.socket:
+        print("--socket is required", file=sys.stderr)
+        return 2
+    if args.toggle:
+        return toggle(args.socket)
+    if args.status:
+        return show_status(args.socket)
+    return run_daemon(args.socket)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)
