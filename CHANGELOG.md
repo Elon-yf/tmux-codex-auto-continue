@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.1.3 - 2026-07-22
+
+- Keep newly observed retry/completion events for up to 30 seconds when a tmux
+  pane mode owns the keyboard, then recover only if the event is still the
+  current visible terminal state after the mode exits.
+- Treat every nonzero `pane_in_mode` depth as active, including nested mode
+  stacks reported as `2` or higher.
+- Revalidate the exact terminal event, empty composer, Codex process, global
+  option, pane mode, and safety menu immediately before submitting input.
+- Cancel deferred input after a manual `Continue`, later assistant/tool output,
+  a new terminal event, a resize, a safety menu, or the 30-second deadline.
+- Extend the isolated tmux integration test with pane-mode recovery and
+  manual-recovery deduplication.
+
 ## v0.1.2 - 2026-07-21
 
 - Recognize strict column-zero `─ Worked for ... ─` completion separators,
