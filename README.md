@@ -12,17 +12,17 @@ choice.
 
 ## Quick install
 
-Pinned one-line installer (v0.1.2):
+Pinned one-line installer (v0.1.3):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.1.2/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.1.3/install.sh | sh
 ```
 
 For an audit-first install, download and inspect the script before running it:
 
 ```sh
 curl -fsSLo /tmp/tmux-codex-install.sh \
-  https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.1.2/install.sh
+  https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.1.3/install.sh
 less /tmp/tmux-codex-install.sh
 sh /tmp/tmux-codex-install.sh
 ```
@@ -64,8 +64,9 @@ The watcher fails closed and sends input only after all relevant checks pass:
 
 - The pane's actual foreground process group must contain the native Codex
   executable under an npm `@openai/codex/.../vendor/.../codex` path.
-- Shells, Claude, dead panes, copy mode, changed process groups, and disabled
-  tmux servers are ignored.
+- Shells, Claude, dead panes, changed process groups, and disabled tmux servers
+  are ignored. Every nonzero tmux pane-mode depth is treated as owning the
+  keyboard, including nested copy-mode stacks.
 - Error and completion messages require Codex's exact column-zero glyph and
   structure, preventing ordinary user prompts and indented/quoted text from
   matching.
@@ -77,6 +78,11 @@ The watcher fails closed and sends input only after all relevant checks pass:
   before Enter. It latches the handled menu until the menu disappears.
 - The ordinary event/recovery path rechecks that no selection menu owns the
   keyboard immediately before it sends `Continue`.
+- Retry/completion events first seen while a pane mode owns the keyboard are
+  retained for at most 30 seconds. After mode exits, the watcher sends only if
+  that exact event is still the current visible terminal state and the composer
+  is empty. Manual `Continue`, later output, a new event, resize, menu, disable,
+  or timeout cancels the deferred action.
 - `Continue` uses bracketed paste followed by a real Enter. This avoids Codex's
   rapid-character paste-burst handling, which can turn Enter into a newline.
 
@@ -91,7 +97,7 @@ No tmux session or pane is created, renamed, closed, or killed.
 - Codex CLI installed from the npm `@openai/codex` package
 - UTF-8 terminal and the English Codex UI
 
-v0.1.2 is tested with Codex CLI 0.144.5, plus an isolated tmux integration
+v0.1.3 is tested with Codex CLI 0.144.5, plus an isolated tmux integration
 using a native fake-Codex process. Codex UI wording and layout may change in
 later releases; unknown layouts are ignored rather than matched loosely.
 macOS, Homebrew/standalone Codex binaries, localized UI text, and non-Linux
@@ -145,9 +151,9 @@ are stored at `~/.cache/tmux-codex-auto-continue.log`. A separate tmux socket
 
 ## Update and uninstall
 
-Re-run the pinned installer after changing `v0.1.2` to a newer release tag.
-It replaces only the verified watcher process for the default tmux socket; it
-does not restart the tmux server or any pane. Existing v0.1.1 configurations
+Re-run the pinned v0.1.3 installer to update. It replaces only the verified
+watcher process for the default tmux socket; it does not restart the tmux
+server or any pane. Existing v0.1.1 configurations
 remain opted out of `Worked for` continuation until you add:
 
 ```tmux
@@ -164,7 +170,7 @@ After manually replacing the executable, reload it safely with:
 To remove a curl installation:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.1.2/uninstall.sh | sh
+curl -fsSL https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.1.3/uninstall.sh | sh
 ```
 
 The uninstaller disables both options, removes only the marked config block
@@ -189,10 +195,11 @@ shellcheck install.sh uninstall.sh tmux-codex-auto-continue.tmux
 The built-in tests cover error and completion signatures, three-item and
 two-item menu parsing, selected rows, and quoted/stale prompt rejection. The
 integration test uses an isolated tmux server and a native fake-Codex process
-to verify opt-in gating, `Worked for` submission, quoted-line rejection, and
-watcher-only restart. Separately, the safety-menu path was exercised against
-an isolated native fake-Codex process to verify Down+Enter, Enter-only, and no
-repeated keys.
+to verify opt-in gating, `Worked for` submission, quoted-line rejection,
+bounded pane-mode recovery, manual-recovery deduplication, and watcher-only
+restart. Separately, the safety-menu path was exercised against an isolated
+native fake-Codex process to verify Down+Enter, Enter-only, and no repeated
+keys.
 
 Security reports should follow [SECURITY.md](SECURITY.md).
 
