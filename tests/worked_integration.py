@@ -115,6 +115,17 @@ def main() -> int:
         time.sleep(2.5)
         assert capture().count(SUBMITTED_MARKER) == 1, capture()
 
+        overloaded = (
+            "■ Our servers are currently overloaded. Please try again later.  ---"
+        )
+        send_line("printf '%s\\n' " + shlex.quote(overloaded))
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if capture().count(SUBMITTED_MARKER) == 2:
+                break
+            time.sleep(0.25)
+        assert capture().count(SUBMITTED_MARKER) == 2, capture()
+
         # An event that arrives while copy mode owns the pane is deferred. It
         # must not receive input in mode, but should recover after mode exits.
         first_error_id = "2b10afaf-84a8-45ee-8901-c32631c94493"
@@ -130,15 +141,15 @@ def main() -> int:
         entered_mode = tmux("copy-mode", "-t", "0")
         assert entered_mode.returncode == 0, entered_mode.stderr
         time.sleep(2.5)
-        assert capture().count(SUBMITTED_MARKER) == 1, capture()
+        assert capture().count(SUBMITTED_MARKER) == 2, capture()
         exited_mode = tmux("send-keys", "-t", "0", "-X", "cancel")
         assert exited_mode.returncode == 0, exited_mode.stderr
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            if capture().count(SUBMITTED_MARKER) == 2:
+            if capture().count(SUBMITTED_MARKER) == 3:
                 break
             time.sleep(0.25)
-        assert capture().count(SUBMITTED_MARKER) == 2, diagnostics()
+        assert capture().count(SUBMITTED_MARKER) == 3, diagnostics()
 
         # Manual recovery during the settle window makes the deferred event
         # stale. The watcher must not submit a duplicate Continue afterward.
@@ -155,12 +166,12 @@ def main() -> int:
         entered_mode = tmux("copy-mode", "-t", "0")
         assert entered_mode.returncode == 0, entered_mode.stderr
         time.sleep(2.5)
-        assert capture().count(SUBMITTED_MARKER) == 2, capture()
+        assert capture().count(SUBMITTED_MARKER) == 3, capture()
         exited_mode = tmux("send-keys", "-t", "0", "-X", "cancel")
         assert exited_mode.returncode == 0, exited_mode.stderr
         send_line("Continue")
         time.sleep(3.0)
-        assert capture().count(SUBMITTED_MARKER) == 3, capture()
+        assert capture().count(SUBMITTED_MARKER) == 4, capture()
 
         restarted = subprocess.run(
             ["python3", str(WATCHER), "--socket", socket, "--restart"],
@@ -176,6 +187,7 @@ def main() -> int:
         watcher_log.flush()
         output = watcher_log_path.read_text()
         assert "event=worked" in output
+        assert "event=server_overloaded" in output
         assert f"deferred error:{first_error_id}" in output
         assert "reason=pane-mode" in output
         assert "event=error" in output

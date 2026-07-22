@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.5 - 2026-07-22
+
+- Recognize the strict column-zero Codex message
+  `■ Our servers are currently overloaded. Please try again later.`, including
+  its optional displayed `---` suffix.
+- Submit `Continue` with bracketed paste followed by a real Enter, while keeping
+  quoted and indented lookalikes excluded.
+
 ## v0.1.4 - 2026-07-22
 
 - Keep `Worked for ...` continuation disabled in newly generated curl-install
