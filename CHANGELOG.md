@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.1.4 - 2026-07-22
+
+- Keep `Worked for ...` continuation disabled in newly generated curl-install
+  configurations. Users must opt in explicitly with
+  `@codex-auto-continue-worked on`.
+- Preserve existing configuration files during upgrades, including an existing
+  explicit `on` or `off` choice.
+
 ## v0.1.3 - 2026-07-22
 
 - Keep newly observed retry/completion events for up to 30 seconds when a tmux
