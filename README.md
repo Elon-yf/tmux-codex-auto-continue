@@ -12,17 +12,17 @@ safety-buffering choice.
 
 ## Quick install
 
-Pinned one-line installer (v0.1.4):
+Pinned one-line installer (v0.1.5):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.1.4/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.1.5/install.sh | sh
 ```
 
 For an audit-first install, download and inspect the script before running it:
 
 ```sh
 curl -fsSLo /tmp/tmux-codex-install.sh \
-  https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.1.4/install.sh
+  https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.1.5/install.sh
 less /tmp/tmux-codex-install.sh
 sh /tmp/tmux-codex-install.sh
 ```
@@ -38,6 +38,7 @@ idempotent.
 | --- | --- |
 | `■ An error occurred while processing ...` | Paste `Continue`, then send a real Enter |
 | `■ internal streaming error, please retry` | Paste `Continue`, then send a real Enter |
+| `■ Our servers are currently overloaded. Please try again later.` | Paste `Continue`, then send a real Enter |
 | `⚠ Selected model is at capacity. Please try a different model.` | Paste `Continue`, then send a real Enter |
 | Active `Additional safety checks` menu, Retry selected | Down, verify `Keep waiting`, then Enter |
 | Active menu, `Keep waiting` already selected | Enter only |
@@ -96,7 +97,7 @@ No tmux session or pane is created, renamed, closed, or killed.
 - Codex CLI installed from the npm `@openai/codex` package
 - UTF-8 terminal and the English Codex UI
 
-v0.1.4 is tested with Codex CLI 0.144.5, plus isolated tmux integrations
+v0.1.5 is tested with Codex CLI 0.144.5, plus isolated tmux integrations
 using a native fake-Codex process. Codex UI wording and layout may change in
 later releases; unknown layouts are ignored rather than matched loosely.
 macOS, Homebrew/standalone Codex binaries, localized UI text, and non-Linux
@@ -151,7 +152,7 @@ are stored at `~/.cache/tmux-codex-auto-continue.log`. A separate tmux socket
 
 ## Update and uninstall
 
-Re-run the pinned v0.1.4 installer to update. It replaces only the verified
+Re-run the pinned v0.1.5 installer to update. It replaces only the verified
 watcher process for the default tmux socket; it does not restart the tmux
 server or any pane. Existing configuration files retain their explicit choice;
 new configurations leave `Worked for` continuation off until you add:
@@ -170,7 +171,7 @@ After manually replacing the executable, reload it safely with:
 To remove a curl installation:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.1.4/uninstall.sh | sh
+curl -fsSL https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.1.5/uninstall.sh | sh
 ```
 
 The uninstaller disables both options, removes only the marked config block
