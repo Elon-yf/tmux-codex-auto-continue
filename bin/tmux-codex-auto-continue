@@ -34,7 +34,7 @@ REPLY = "Continue"
 OPTION_NAME = "@codex-auto-continue"
 WORKED_OPTION_NAME = "@codex-auto-continue-worked"
 EMPTY_COMPOSER_CURSOR_X = 2
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 
 # Requiring Codex's exact event glyph and structure in column zero avoids
 # matching quoted text in user prompts, assistant messages, or shell output.

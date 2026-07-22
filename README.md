@@ -1,8 +1,8 @@
 # tmux-codex-auto-continue
 
-An unofficial tmux watcher that continues completed Codex CLI turns, recovers
-selected retry states, and accepts Codex's **Keep waiting** safety-buffering
-choice.
+An unofficial tmux watcher that optionally continues completed Codex CLI
+turns, recovers selected retry states, and accepts Codex's **Keep waiting**
+safety-buffering choice.
 
 > [!WARNING]
 > This plugin injects keys into a verified Codex pane. Continuing every
@@ -12,17 +12,17 @@ choice.
 
 ## Quick install
 
-Pinned one-line installer (v0.1.3):
+Pinned one-line installer (v0.1.4):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.1.3/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.1.4/install.sh | sh
 ```
 
 For an audit-first install, download and inspect the script before running it:
 
 ```sh
 curl -fsSLo /tmp/tmux-codex-install.sh \
-  https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.1.3/install.sh
+  https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.1.4/install.sh
 less /tmp/tmux-codex-install.sh
 sh /tmp/tmux-codex-install.sh
 ```
@@ -52,11 +52,10 @@ Normal-completion continuation is controlled separately by:
 set -g @codex-auto-continue-worked on
 ```
 
-The watcher defaults this option to off so upgrades do not silently turn error
-recovery into an unbounded continuation loop. The curl installer adds the
-explicit opt-in for new configurations. Each injected `Continue` can itself
-finish with another `Worked for` line, so leave this off unless that repeated
-behavior is intentional.
+The watcher treats an unset option as off, and a fresh curl configuration
+explicitly sets it to off. Upgrades preserve an existing `on` or `off` choice.
+Each injected `Continue` can itself finish with another `Worked for` line, so
+opt in only when that repeated behavior is intentional.
 
 ## Safety model
 
@@ -97,7 +96,7 @@ No tmux session or pane is created, renamed, closed, or killed.
 - Codex CLI installed from the npm `@openai/codex` package
 - UTF-8 terminal and the English Codex UI
 
-v0.1.3 is tested with Codex CLI 0.144.5, plus an isolated tmux integration
+v0.1.4 is tested with Codex CLI 0.144.5, plus isolated tmux integrations
 using a native fake-Codex process. Codex UI wording and layout may change in
 later releases; unknown layouts are ignored rather than matched loosely.
 macOS, Homebrew/standalone Codex binaries, localized UI text, and non-Linux
@@ -110,7 +109,8 @@ and add the plugin before TPM's own `run` line:
 
 ```tmux
 set -g @codex-auto-continue on
-set -g @codex-auto-continue-worked on
+# Optional; normal-completion continuation defaults off:
+# set -g @codex-auto-continue-worked on
 set -g @plugin 'yeahdongcn/tmux-codex-auto-continue'
 
 # Keep this at the bottom of .tmux.conf:
@@ -151,10 +151,10 @@ are stored at `~/.cache/tmux-codex-auto-continue.log`. A separate tmux socket
 
 ## Update and uninstall
 
-Re-run the pinned v0.1.3 installer to update. It replaces only the verified
+Re-run the pinned v0.1.4 installer to update. It replaces only the verified
 watcher process for the default tmux socket; it does not restart the tmux
-server or any pane. Existing v0.1.1 configurations
-remain opted out of `Worked for` continuation until you add:
+server or any pane. Existing configuration files retain their explicit choice;
+new configurations leave `Worked for` continuation off until you add:
 
 ```tmux
 set -g @codex-auto-continue-worked on
@@ -170,7 +170,7 @@ After manually replacing the executable, reload it safely with:
 To remove a curl installation:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.1.3/uninstall.sh | sh
+curl -fsSL https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.1.4/uninstall.sh | sh
 ```
 
 The uninstaller disables both options, removes only the marked config block
@@ -185,10 +185,13 @@ command), or remove its plugin directory manually.
 ```sh
 python3 bin/tmux-codex-auto-continue --self-test
 python3 tests/worked_integration.py
+python3 tests/install_integration.py
 python3 -m py_compile bin/tmux-codex-auto-continue
 python3 -m py_compile tests/worked_integration.py
+python3 -m py_compile tests/install_integration.py
 ruff check bin/tmux-codex-auto-continue
 ruff check tests/worked_integration.py
+ruff check tests/install_integration.py
 shellcheck install.sh uninstall.sh tmux-codex-auto-continue.tmux
 ```
 
@@ -197,9 +200,10 @@ two-item menu parsing, selected rows, and quoted/stale prompt rejection. The
 integration test uses an isolated tmux server and a native fake-Codex process
 to verify opt-in gating, `Worked for` submission, quoted-line rejection,
 bounded pane-mode recovery, manual-recovery deduplication, and watcher-only
-restart. Separately, the safety-menu path was exercised against an isolated
-native fake-Codex process to verify Down+Enter, Enter-only, and no repeated
-keys.
+restart. The installer integration verifies that fresh configurations keep
+`Worked for` continuation off and upgrades preserve existing choices.
+Separately, the safety-menu path was exercised against an isolated native
+fake-Codex process to verify Down+Enter, Enter-only, and no repeated keys.
 
 Security reports should follow [SECURITY.md](SECURITY.md).
 

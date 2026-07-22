@@ -2,9 +2,9 @@
 set -eu
 umask 077
 
-VERSION=v0.1.3
+VERSION=v0.1.4
 REPO_RAW_BASE=${TMUX_CODEX_AUTO_CONTINUE_RAW_BASE:-"https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/$VERSION"}
-WATCHER_SHA256=5a38caafad87c7ae70c3e8e35a0d18d8a7c5325b4cd70014d51c932dd3d51b23
+WATCHER_SHA256=41ff7a9bfbdbf21152728befda69fea3a79b1be2f658a0dadeec0b63d927c26f
 BIN_DIR=${TMUX_CODEX_AUTO_CONTINUE_BIN_DIR:-"$HOME/.local/bin"}
 TMUX_CONF=${TMUX_CODEX_AUTO_CONTINUE_TMUX_CONF:-"$HOME/.tmux.conf"}
 INSTALL_CONFIG=1
@@ -63,7 +63,7 @@ if [ "$INSTALL_CONFIG" -eq 1 ]; then
             printf '\n%s\n' "$start_marker"
             printf '%s\n' '# Auto-continue recognized Codex completion/retry/wait prompts.'
             printf '%s\n' 'set -goq @codex-auto-continue on'
-            printf '%s\n' 'set -goq @codex-auto-continue-worked on'
+            printf '%s\n' 'set -goq @codex-auto-continue-worked off'
             printf "bind-key A run-shell -b '\"%s\" --socket \"#{socket_path}\" --toggle'\n" "$script"
             printf "run-shell -b 'mkdir -p \"%s/.cache\" && \"%s\" --socket \"#{socket_path}\" >> \"%s/.cache/tmux-codex-auto-continue.log\" 2>&1'\n" "$HOME" "$script" "$HOME"
             printf '%s\n' "$end_marker"
