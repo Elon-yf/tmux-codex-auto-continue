@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Continue completed Codex turns and recover selected retry/wait states.
+"""Recover interrupted Codex turns and selected retry/wait states.
 
 The watcher is scoped to one tmux server and discovers its panes dynamically.
 It only sends input when the foreground process group is a Codex CLI process.
@@ -30,11 +30,11 @@ MENU_REDRAW_TIMEOUT_SECONDS = 0.75
 MENU_REDRAW_POLL_SECONDS = 0.05
 DAEMON_RESTART_TIMEOUT_SECONDS = 3.0
 CAPTURE_HISTORY_LINES = 400
+MAX_ACTIVITY_TO_WORKED_LINES = 120
 REPLY = "Continue"
 OPTION_NAME = "@codex-auto-continue"
-WORKED_OPTION_NAME = "@codex-auto-continue-worked"
 EMPTY_COMPOSER_CURSOR_X = 2
-VERSION = "0.1.5"
+VERSION = "0.2.0"
 
 # Requiring Codex's exact event glyph and structure in column zero avoids
 # matching quoted text in user prompts, assistant messages, or shell output.
@@ -59,6 +59,19 @@ WORKED_RE = re.compile(
     r"^─ Worked for (?:\d+h )?\d+m \d+s +─+[ \t]*$",
     re.MULTILINE,
 )
+TOP_LEVEL_BULLET_RE = re.compile(r"^• (?P<body>.+)$")
+FINAL_RESPONSE_SEPARATOR_RE = re.compile(r"^[─━═]{20,}[ \t]*$")
+CODEX_ACTIVITY_BULLET_RE = re.compile(
+    r"^(?:"
+    r"Ran|Explored|Edited|Waited for|Added|Updated Plan|"
+    r"Interacted with|Started|Called|Waiting for agents|"
+    r"Finished waiting|Context compacted|Interrupted"
+    r")(?:\s|$)"
+)
+WORKED_INTERRUPTED = "worked_interrupted"
+WORKED_COMPLETE = "worked_complete"
+WORKED_UNKNOWN = "worked_unknown"
+NON_ACTIONABLE_EVENTS = frozenset({WORKED_COMPLETE, WORKED_UNKNOWN})
 SAFETY_MENU_HEADER_RE = re.compile(
     r"^  Additional safety checks[ \t]*$",
 )
@@ -120,6 +133,48 @@ def log(message: str) -> None:
     print(f"{timestamp} {message}", flush=True)
 
 
+def classify_worked(text: str, worked_start: int) -> str:
+    """Classify a Worked marker from the transcript immediately before it.
+
+    Codex renders a full-width separator immediately before its final response
+    block.  An interrupted turn instead ends on an internal activity block
+    such as Ran, Explored, or Edited.  Unknown layouts fail closed.
+    """
+
+    lines = text[:worked_start].splitlines()
+    bullet_index: int | None = None
+    bullet_body = ""
+    for index in range(len(lines) - 1, -1, -1):
+        bullet = TOP_LEVEL_BULLET_RE.fullmatch(lines[index])
+        if bullet is not None:
+            bullet_index = index
+            bullet_body = bullet.group("body")
+            break
+
+    if bullet_index is None:
+        return WORKED_UNKNOWN
+
+    previous_index = bullet_index - 1
+    while previous_index >= 0 and not lines[previous_index].strip():
+        previous_index -= 1
+    # If capture-pane starts exactly on the activity header, its real
+    # predecessor was truncated and cannot be checked. Also avoid associating
+    # a very old activity block with a later, otherwise unknown Worked marker.
+    if (
+        previous_index < 0
+        or len(lines) - bullet_index - 1 > MAX_ACTIVITY_TO_WORKED_LINES
+    ):
+        return WORKED_UNKNOWN
+    if (
+        FINAL_RESPONSE_SEPARATOR_RE.fullmatch(lines[previous_index]) is not None
+    ):
+        return WORKED_COMPLETE
+
+    if CODEX_ACTIVITY_BULLET_RE.match(bullet_body) is not None:
+        return WORKED_INTERRUPTED
+    return WORKED_UNKNOWN
+
+
 def event_records(text: str) -> list[tuple[int, int, str]]:
     """Return ordered matches with source spans and normalized signatures."""
 
@@ -150,7 +205,13 @@ def event_records(text: str) -> list[tuple[int, int, str]]:
         matches.append((match.start(), match.end(), "server_overloaded"))
 
     for match in WORKED_RE.finditer(text):
-        matches.append((match.start(), match.end(), "worked"))
+        matches.append(
+            (
+                match.start(),
+                match.end(),
+                classify_worked(text, match.start()),
+            )
+        )
 
     matches.sort(key=lambda item: item[0])
     return matches
@@ -162,27 +223,48 @@ def event_signatures(text: str) -> list[str]:
     return [signature for _, _, signature in event_records(text)]
 
 
-def terminal_event_is_current_text(text: str, event: str) -> bool:
+def terminal_suffix_is_idle(suffix: str) -> bool:
+    """Return whether no later submitted prompt or Codex output is visible."""
+
+    if re.search(r"^›[ \t]+Continue[ \t]*$", suffix, re.MULTILINE):
+        return False
+    if re.search(r"^(?:•|■|└|│)[ \t]", suffix, re.MULTILINE):
+        return False
+    if len(re.findall(r"^›[ \t].*$", suffix, re.MULTILINE)) > 1:
+        return False
+    return True
+
+
+def terminal_event_is_current_text(
+    text: str,
+    event: str,
+    *,
+    context_text: str | None = None,
+) -> bool:
     """Reject a deferred event once a later turn is visible in the pane."""
 
-    records = event_records(text)
+    validation_text = (
+        context_text
+        if event == WORKED_INTERRUPTED and context_text is not None
+        else text
+    )
+    records = event_records(validation_text)
     if not records or records[-1][2] != event:
         return False
 
     _, end, _ = records[-1]
-    suffix = text[end:]
-    # A manually submitted Continue is a stronger signal than cursor position:
-    # Codex can keep an empty-looking composer while it is already working.
-    if re.search(r"^›[ \t]+Continue[ \t]*$", suffix, re.MULTILINE):
+    if not terminal_suffix_is_idle(validation_text[end:]):
         return False
-    # These markers indicate a later assistant/tool turn after the deferred
-    # event.  Sending into that turn would be an unsafe stale replay.
-    if re.search(r"^(?:•|■|└|│)[ \t]", suffix, re.MULTILINE):
-        return False
-    # More than one prompt marker means the original composer was submitted
-    # and a new composer was rendered afterward.
-    if len(re.findall(r"^›[ \t].*$", suffix, re.MULTILINE)) > 1:
-        return False
+
+    if event == WORKED_INTERRUPTED:
+        # The activity bullet can scroll above the viewport after large tool
+        # output. Keep the original 400-line classification evidence, but
+        # still require its Worked marker and idle composer to be visible now.
+        visible_worked = list(WORKED_RE.finditer(text))
+        if not visible_worked:
+            return False
+        if not terminal_suffix_is_idle(text[visible_worked[-1].end() :]):
+            return False
     return True
 
 
@@ -448,7 +530,7 @@ def pane_cursor_x(socket: str, pane: str) -> int | None:
         return None
 
 
-def capture_events(socket: str, pane: str) -> list[str] | None:
+def capture_event_text(socket: str, pane: str) -> str | None:
     result = run_tmux(
         socket,
         "capture-pane",
@@ -461,7 +543,14 @@ def capture_events(socket: str, pane: str) -> list[str] | None:
     )
     if result.returncode != 0:
         return None
-    return event_signatures(result.stdout)
+    return result.stdout
+
+
+def capture_events(socket: str, pane: str) -> list[str] | None:
+    text = capture_event_text(socket, pane)
+    if text is None:
+        return None
+    return event_signatures(text)
 
 
 def capture_visible_text(socket: str, pane: str) -> str | None:
@@ -477,8 +566,17 @@ def current_terminal_events(
     text = capture_visible_text(socket, pane)
     if text is None:
         return []
+    context_text = capture_event_text(socket, pane)
+    if context_text is None:
+        return []
     return [
-        event for event in events if terminal_event_is_current_text(text, event)
+        event
+        for event in events
+        if terminal_event_is_current_text(
+            text,
+            event,
+            context_text=context_text,
+        )
     ]
 
 
@@ -499,10 +597,6 @@ def tmux_option_enabled(socket: str, option_name: str) -> bool:
 
 def option_enabled(socket: str) -> bool:
     return tmux_option_enabled(socket, OPTION_NAME)
-
-
-def worked_option_enabled(socket: str) -> bool:
-    return tmux_option_enabled(socket, WORKED_OPTION_NAME)
 
 
 def clear_pending(state: PaneState) -> None:
@@ -594,8 +688,16 @@ def send_continue(
     if safety_menu_selection(visible_text) is not None:
         log(f"skipped pane {pane}: safety menu owns the keyboard")
         return False
+    context_text = capture_event_text(socket, pane)
+    if context_text is None:
+        log(f"skipped pane {pane}: pane history is unavailable")
+        return False
     if not any(
-        terminal_event_is_current_text(visible_text, event)
+        terminal_event_is_current_text(
+            visible_text,
+            event,
+            context_text=context_text,
+        )
         for event in expected_events
     ):
         log(f"skipped pane {pane}: terminal event is no longer current")
@@ -758,7 +860,6 @@ def run_daemon(socket: str) -> int:
 
         now = time.monotonic()
         enabled = option_enabled(socket)
-        worked_enabled = worked_option_enabled(socket)
         seen_panes: set[str] = set()
 
         for pane, pane_pid, session, in_mode, geometry in panes:
@@ -801,7 +902,7 @@ def run_daemon(socket: str) -> int:
             actionable_events = [
                 event
                 for event in new_events
-                if event != "worked" or worked_enabled
+                if event not in NON_ACTIONABLE_EVENTS
             ]
             expire_deferred_events(state, now, pane, session)
 
@@ -818,9 +919,16 @@ def run_daemon(socket: str) -> int:
             # Keep newly observed terminal events for a short, bounded window,
             # then revalidate them against the live viewport after mode exits.
             if in_mode:
+                if new_events:
+                    clear_pending(state)
+                    state.deferred_events.clear()
                 defer_events(
                     state,
-                    actionable_events + list(state.pending_events),
+                    (
+                        actionable_events
+                        if new_events
+                        else list(state.pending_events)
+                    ),
                     now,
                     pane,
                     session,
@@ -857,16 +965,19 @@ def run_daemon(socket: str) -> int:
                         )
                 continue
 
-            if actionable_events:
-                # A new event in normal mode supersedes any older deferred
-                # state. The new event follows the existing immediate path.
+            if new_events:
+                # Every new terminal marker supersedes older pending state.
+                # Normal and unknown Worked layouts are deliberately tracked
+                # but never scheduled, so they also cancel a stale retry.
+                clear_pending(state)
                 state.deferred_events.clear()
-                schedule_pending(
-                    state,
-                    actionable_events,
-                    now,
-                    deferred=False,
-                )
+                if actionable_events:
+                    schedule_pending(
+                        state,
+                        actionable_events,
+                        now,
+                        deferred=False,
+                    )
             elif not state.pending_events and state.deferred_events:
                 current_events = current_terminal_events(
                     socket, pane, list(state.deferred_events)
@@ -903,14 +1014,6 @@ def run_daemon(socket: str) -> int:
                 clear_pending(state)
                 state.deferred_events.clear()
                 continue
-            if not worked_option_enabled(socket):
-                state.pending_events.discard("worked")
-                state.pending_deferred_events.discard("worked")
-                state.deferred_events.pop("worked", None)
-                if not state.pending_events:
-                    clear_pending(state)
-                    continue
-
             current_events = current_terminal_events(
                 socket,
                 pane,
@@ -1027,12 +1130,9 @@ def restart_daemon(socket: str) -> int:
 
 def show_status(socket: str) -> int:
     enabled = "on" if option_enabled(socket) else "off"
-    worked = "on" if worked_option_enabled(socket) else "off"
     pid = daemon_pid(socket)
     daemon = str(pid) if pid is not None else "not running"
-    print(
-        f"enabled={enabled} worked={worked} daemon={daemon} socket={socket}"
-    )
+    print(f"enabled={enabled} daemon={daemon} socket={socket}")
 
     panes = list_panes(socket)
     if panes is None:
@@ -1052,9 +1152,8 @@ def self_test() -> int:
     assert tmux_mode_active("")
     assert tmux_mode_active("unexpected")
 
-    sample = "\n".join(
+    retry_sample = "\n".join(
         [
-            "─ Worked for 15m 36s ─────────────────────────",
             (
                 "■ An error occurred while processing your request. You can retry "
                 "your request. Please include the request ID "
@@ -1079,7 +1178,6 @@ def self_test() -> int:
         ]
     )
     expected = [
-        "worked",
         "error:4031e3df-b388-458c-aa39-38f0fffa8295",
         "streaming_error",
         "streaming_error",
@@ -1087,14 +1185,92 @@ def self_test() -> int:
         "server_overloaded",
         "capacity",
     ]
-    assert event_signatures(sample) == expected
+    assert event_signatures(retry_sample) == expected
+
+    interrupted_worked = "\n".join(
+        [
+            "› Implement the requested change",
+            "",
+            "• Ran cargo test",
+            "  └ 42 tests passed",
+            "",
+            "─ Worked for 15m 36s ─────────────────────────",
+            "",
+            "› ",
+        ]
+    )
+    normal_worked = "\n".join(
+        [
+            "• Ran cargo test",
+            "  └ 42 tests passed",
+            "",
+            "──────────────────────────────────────────────",
+            "",
+            "• Ran all requested tests successfully.",
+            "",
+            "─ Worked for 1h 29m 00s ──────────────────────",
+            "",
+            "› ",
+        ]
+    )
+    unknown_worked = "\n".join(
+        [
+            "output without a recognized Codex activity block",
+            "─ Worked for 10m 56s ───────────────",
+            "",
+            "› ",
+        ]
+    )
+    assert event_signatures(interrupted_worked) == [WORKED_INTERRUPTED]
+    assert event_signatures(normal_worked) == [WORKED_COMPLETE]
+    assert event_signatures(unknown_worked) == [WORKED_UNKNOWN]
+    truncated_activity_context = "\n".join(
+        [
+            "• Ran cargo test",
+            "  └ capture starts on the activity header",
+            "─ Worked for 0m 03s ───────────────",
+        ]
+    )
+    assert event_signatures(truncated_activity_context) == [WORKED_UNKNOWN]
+    distant_activity_context = "\n".join(
+        [
+            "› Implement the requested change",
+            "• Ran cargo test",
+            *("  tool output" for _ in range(MAX_ACTIVITY_TO_WORKED_LINES + 1)),
+            "─ Worked for 0m 04s ───────────────",
+        ]
+    )
+    assert event_signatures(distant_activity_context) == [WORKED_UNKNOWN]
+    for activity in (
+        "Explored",
+        "Edited src/main.rs (+1 -1)",
+        "Waited for background terminal",
+        "Added a test",
+        "Updated Plan",
+        "Interacted with terminal",
+        "Started command",
+        "Called helper",
+        "Waiting for agents",
+        "Finished waiting",
+        "Context compacted",
+        "Interrupted",
+    ):
+        fixture = (
+            "› Continue the task\n\n"
+            f"• {activity}\n"
+            "  └ tool output\n\n"
+            "─ Worked for 2h 00m 20s ─────────────────\n\n› "
+        )
+        assert event_signatures(fixture) == [WORKED_INTERRUPTED], activity
     assert event_signatures(
         "  ─ Worked for 15m 36s ─────\n"
         "  ■ An error occurred while processing your request."
     ) == []
-    assert event_signatures("─ Worked for 1h 29m 00s ─────") == ["worked"]
+    assert event_signatures("─ Worked for 1h 29m 00s ─────") == [
+        WORKED_UNKNOWN
+    ]
     assert event_signatures("─ Worked for 10m 56s ───────────────") == [
-        "worked"
+        WORKED_UNKNOWN
     ]
     assert event_signatures("› ─ Worked for 10m 56s ───────────────") == []
     assert event_signatures("› ■ internal streaming error, please retry ---") == []
@@ -1150,6 +1326,35 @@ def self_test() -> int:
         error_signature,
     )
     assert not terminal_event_is_current_text(current_error, "streaming_error")
+
+    cropped_worked_view = "\n".join(
+        [
+            "  398 lines of tool output scrolled the activity header away",
+            "─ Worked for 15m 36s ─────────────────────────",
+            "",
+            "› ",
+        ]
+    )
+    assert terminal_event_is_current_text(
+        cropped_worked_view,
+        WORKED_INTERRUPTED,
+        context_text=interrupted_worked,
+    )
+    assert not terminal_event_is_current_text(
+        cropped_worked_view.replace("› ", "› Continue"),
+        WORKED_INTERRUPTED,
+        context_text=interrupted_worked,
+    )
+    assert not terminal_event_is_current_text(
+        normal_worked,
+        WORKED_INTERRUPTED,
+        context_text=normal_worked,
+    )
+    assert not terminal_event_is_current_text(
+        normal_worked,
+        WORKED_INTERRUPTED,
+        context_text=f"{interrupted_worked}\n{normal_worked}",
+    )
 
     safety_popup = "\n".join(
         [

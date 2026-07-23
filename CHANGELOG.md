@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.2.0 - 2026-07-23
+
+- Remove the normal-completion opt-in path: completed Codex turns are always
+  ignored, and only high-confidence interrupted `Worked for` states trigger
+  `Continue` plus Enter.
+- Distinguish normal final responses from interrupted internal activity blocks
+  such as `Ran`, `Explored`, and `Edited`; unknown, distant, and truncated
+  layouts fail closed.
+- Revalidate interruption evidence from bounded history while still requiring
+  the `Worked for` marker and idle composer in the live viewport.
+- Remove the obsolete `@codex-auto-continue-worked` status/config surface and
+  migrate it out of curl-managed configurations during upgrade.
+
 ## v0.1.5 - 2026-07-22
 
 - Recognize the strict column-zero Codex message

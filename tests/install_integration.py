@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify fresh installer defaults and preserves an existing choice."""
+"""Verify fresh installation and legacy Worked-option migration."""
 
 from __future__ import annotations
 
@@ -122,23 +122,32 @@ def main() -> int:
             assert installed.returncode == 0, installed.stdout
             config = home / ".tmux.conf"
             config_text = config.read_text(encoding="utf-8")
-            assert f"{WORKED_OPTION} off" in config_text
-            assert f"{WORKED_OPTION} on" not in config_text
+            assert WORKED_OPTION not in config_text
             assert tmux("show-options", "-gqv", "@codex-auto-continue").stdout.strip() == "on"
-            assert (
-                tmux("show-options", "-gqv", "@codex-auto-continue-worked").stdout.strip()
-                == "off"
-            )
+            assert not tmux(
+                "show-options", "-gqv", "@codex-auto-continue-worked"
+            ).stdout.strip()
 
-            # An upgrade must not overwrite a user's existing explicit choice.
+            # Upgrade a v0.1.x managed block and live tmux option. The removed
+            # mechanism must not remain in either surface.
             config.write_text(
-                config_text.replace(f"{WORKED_OPTION} off", f"{WORKED_OPTION} on"),
+                config_text.replace(
+                    "set -goq @codex-auto-continue on",
+                    "set -goq @codex-auto-continue on\n"
+                    f"{WORKED_OPTION} on",
+                ),
                 encoding="utf-8",
+            )
+            tmux(
+                "set-option", "-g", "@codex-auto-continue-worked", "on"
             )
             upgraded = run_installer()
             assert upgraded.returncode == 0, upgraded.stdout
             upgraded_text = config.read_text(encoding="utf-8")
-            assert f"{WORKED_OPTION} on" in upgraded_text
+            assert WORKED_OPTION not in upgraded_text
+            assert not tmux(
+                "show-options", "-gqv", "@codex-auto-continue-worked"
+            ).stdout.strip()
             assert upgraded_text.count("# >>> tmux-codex-auto-continue >>>") == 1
             print("install-integration: PASS")
             return 0

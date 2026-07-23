@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Verify Worked-for recovery against an isolated tmux server."""
+"""Verify interrupted-turn recovery against an isolated tmux server."""
 
 from __future__ import annotations
 
@@ -65,6 +65,12 @@ def main() -> int:
         submitted = tmux("send-keys", "-t", "0", "Enter")
         assert submitted.returncode == 0, submitted.stderr
 
+    def emit_lines(*lines: str) -> None:
+        send_line(
+            "printf '%s\\n' "
+            + " ".join(shlex.quote(line) for line in lines)
+        )
+
     def diagnostics() -> str:
         watcher_log.flush()
         return f"{capture()}\nWATCHER LOG:\n{watcher_log_path.read_text()}"
@@ -94,16 +100,60 @@ def main() -> int:
         time.sleep(1.5)
         assert watcher.poll() is None, "watcher exited before the test"
 
-        # Completion continuation is a separate explicit opt-in.
-        send_line("printf '%s\\n' '─ Worked for 0m 01s ───────────────'")
+        # A normal completion has Codex's final-response separator immediately
+        # before the final response block and must never be continued.
+        emit_lines(
+            "• Ran cargo test",
+            "  └ 42 tests passed",
+            "",
+            "────────────────────────────────────────────────────────",
+            "",
+            "• Ran all requested tests successfully.",
+            "",
+            "─ Worked for 0m 01s ───────────────",
+        )
         time.sleep(2.5)
         assert capture().count(SUBMITTED_MARKER) == 0, capture()
-        worked_enabled = tmux(
-            "set-option", "-g", "@codex-auto-continue-worked", "on"
-        )
-        assert worked_enabled.returncode == 0, worked_enabled.stderr
 
-        send_line("printf '%s\\n' '─ Worked for 10m 56s ───────────────'")
+        # An unrecognized transcript shape also fails closed.
+        emit_lines(
+            "plain output without a Codex activity block",
+            "─ Worked for 0m 02s ───────────────",
+        )
+        time.sleep(2.5)
+        assert capture().count(SUBMITTED_MARKER) == 0, capture()
+
+        # A normal completion arriving during the settle window cancels an
+        # older interrupted marker instead of allowing a stale Continue.
+        emit_lines(
+            "• Ran cargo test",
+            "  └ 42 tests passed",
+            "─ Worked for 0m 03s ───────────────",
+        )
+        time.sleep(0.2)
+        emit_lines(
+            "────────────────────────────────────────────────────────",
+            "",
+            "• Ran all requested tests successfully.",
+            "",
+            "─ Worked for 0m 04s ───────────────",
+        )
+        time.sleep(2.5)
+        assert capture().count(SUBMITTED_MARKER) == 0, capture()
+
+        # Interrupted turns end on a recognized internal activity block. Make
+        # its header scroll above the viewport to exercise history-backed
+        # classification plus visible-marker revalidation.
+        tool_output = tuple(
+            f"  {index:02d} diff output" for index in range(40)
+        )
+        emit_lines(
+            "• Edited src/main.rs (+1 -1)",
+            "  └ diff follows",
+            *tool_output,
+            "",
+            "─ Worked for 10m 56s ───────────────",
+        )
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
             if SUBMITTED_MARKER in capture():
@@ -111,7 +161,7 @@ def main() -> int:
             time.sleep(0.25)
         assert capture().count(SUBMITTED_MARKER) == 1, capture()
 
-        send_line("printf '%s\\n' '› ─ Worked for 10m 56s ───────────────'")
+        emit_lines("› ─ Worked for 10m 56s ───────────────")
         time.sleep(2.5)
         assert capture().count(SUBMITTED_MARKER) == 1, capture()
 
@@ -186,7 +236,7 @@ def main() -> int:
         watcher.wait(timeout=5)
         watcher_log.flush()
         output = watcher_log_path.read_text()
-        assert "event=worked" in output
+        assert "event=worked_interrupted" in output
         assert "event=server_overloaded" in output
         assert f"deferred error:{first_error_id}" in output
         assert "reason=pane-mode" in output
@@ -205,7 +255,7 @@ def main() -> int:
         replacement = re.search(r"\bdaemon=(\d+)\b", status.stdout)
         assert replacement is not None, status.stdout
         assert int(replacement.group(1)) != watcher.pid
-        assert "worked=on" in status.stdout
+        assert "worked=" not in status.stdout
         print("worked-integration: PASS")
         return 0
     finally:
