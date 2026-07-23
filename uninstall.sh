@@ -9,7 +9,7 @@ end_marker='# <<< tmux-codex-auto-continue <<<'
 
 if command -v tmux >/dev/null 2>&1; then
     tmux set-option -g @codex-auto-continue off 2>/dev/null || true
-    tmux set-option -g @codex-auto-continue-worked off 2>/dev/null || true
+    tmux set-option -gu @codex-auto-continue-worked 2>/dev/null || true
 fi
 
 if [ -f "$TMUX_CONF" ] && grep -Fq "$start_marker" "$TMUX_CONF"; then

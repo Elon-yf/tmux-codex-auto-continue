@@ -2,9 +2,9 @@
 set -eu
 umask 077
 
-VERSION=v0.1.5
+VERSION=v0.2.0
 REPO_RAW_BASE=${TMUX_CODEX_AUTO_CONTINUE_RAW_BASE:-"https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/$VERSION"}
-WATCHER_SHA256=5a143af98065b7b84421af962cda1a3c6b60f8ffe960cff82294a893c45cee40
+WATCHER_SHA256=b9f2ebee694f2bea20e7f19d3b08ea72158e219ce55227eae8f20823c4730ba2
 BIN_DIR=${TMUX_CODEX_AUTO_CONTINUE_BIN_DIR:-"$HOME/.local/bin"}
 TMUX_CONF=${TMUX_CODEX_AUTO_CONTINUE_TMUX_CONF:-"$HOME/.tmux.conf"}
 INSTALL_CONFIG=1
@@ -43,7 +43,8 @@ fi
 
 mkdir -p "$BIN_DIR" "$HOME/.cache"
 tmp=$(mktemp "${TMPDIR:-/tmp}/tmux-codex-auto-continue.XXXXXX")
-trap 'rm -f "$tmp"' EXIT HUP INT TERM
+config_tmp=
+trap 'rm -f "$tmp" "${config_tmp:-}"' EXIT HUP INT TERM
 curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
     "$REPO_RAW_BASE/bin/tmux-codex-auto-continue" \
     --output "$tmp"
@@ -56,14 +57,26 @@ if [ "$INSTALL_CONFIG" -eq 1 ]; then
     touch "$TMUX_CONF"
     start_marker='# >>> tmux-codex-auto-continue >>>'
     end_marker='# <<< tmux-codex-auto-continue <<<'
+    if grep -Fq "$start_marker" "$TMUX_CONF" 2>/dev/null; then
+        config_tmp=$(mktemp "${TMPDIR:-/tmp}/tmux-codex-config.XXXXXX")
+        awk -v start="$start_marker" -v end="$end_marker" '
+            $0 == start { managed = 1 }
+            managed && $0 == "set -goq @codex-auto-continue-worked off" { next }
+            managed && $0 == "set -goq @codex-auto-continue-worked on" { next }
+            { print }
+            $0 == end { managed = 0 }
+        ' "$TMUX_CONF" > "$config_tmp"
+        chmod --reference="$TMUX_CONF" "$config_tmp"
+        mv "$config_tmp" "$TMUX_CONF"
+        config_tmp=
+    fi
     if ! grep -Fq "$start_marker" "$TMUX_CONF" 2>/dev/null \
         && ! grep -Fq 'tmux-codex-auto-continue' "$TMUX_CONF" 2>/dev/null; then
         script="$BIN_DIR/tmux-codex-auto-continue"
         {
             printf '\n%s\n' "$start_marker"
-            printf '%s\n' '# Auto-continue recognized Codex completion/retry/wait prompts.'
+            printf '%s\n' '# Recover interrupted Codex turns and recognized retry/wait prompts.'
             printf '%s\n' 'set -goq @codex-auto-continue on'
-            printf '%s\n' 'set -goq @codex-auto-continue-worked off'
             printf "bind-key A run-shell -b '\"%s\" --socket \"#{socket_path}\" --toggle'\n" "$script"
             printf "run-shell -b 'mkdir -p \"%s/.cache\" && \"%s\" --socket \"#{socket_path}\" >> \"%s/.cache/tmux-codex-auto-continue.log\" 2>&1'\n" "$HOME" "$script" "$HOME"
             printf '%s\n' "$end_marker"
@@ -74,6 +87,7 @@ if [ "$INSTALL_CONFIG" -eq 1 ]; then
     fi
 
     if tmux source-file "$TMUX_CONF" 2>/dev/null; then
+        tmux set-option -gu @codex-auto-continue-worked 2>/dev/null || true
         socket=$(tmux display-message -p '#{socket_path}')
         "$BIN_DIR/tmux-codex-auto-continue" \
             --socket "$socket" --restart
