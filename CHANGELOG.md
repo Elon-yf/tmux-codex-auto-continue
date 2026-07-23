@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.2.1 - 2026-07-23
+
+- Recognize the complete four-line `ⓘ This content can't be shown` Trusted
+  Access notice and submit `Continue` plus a real Enter.
+- Recognize the complete two-line `■ This content was flagged for possible
+  cybersecurity risk` notice and use the same verified submission path.
+- Require exact column-zero glyphs, wording, indentation, and official URLs;
+  quoted, incomplete, or modified lookalikes fail closed.
+- Treat a later `ⓘ` line as Codex output when rejecting stale deferred events.
+
 ## v0.2.0 - 2026-07-23
 
 - Remove the normal-completion opt-in path: completed Codex turns are always

@@ -34,7 +34,7 @@ MAX_ACTIVITY_TO_WORKED_LINES = 120
 REPLY = "Continue"
 OPTION_NAME = "@codex-auto-continue"
 EMPTY_COMPOSER_CURSOR_X = 2
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 # Requiring Codex's exact event glyph and structure in column zero avoids
 # matching quoted text in user prompts, assistant messages, or shell output.
@@ -53,6 +53,24 @@ STREAMING_ERROR_RE = re.compile(
 SERVER_OVERLOADED_RE = re.compile(
     r"^■ Our servers are currently overloaded\. Please try again later\."
     r"(?:[ \t]+---)?[ \t]*$",
+    re.MULTILINE,
+)
+CYBER_CONTENT_BLOCKED_RE = re.compile(
+    r"^ⓘ This content can't be shown[ \t]*\n"
+    r"  We take extra caution with cybersecurity requests\. If you’re a "
+    r"security professional, you may be able to apply for Trusted Access\."
+    r"[ \t]*\n"
+    r"  Trusted Access: "
+    r"https://openai\.com/form/enterprise-trusted-access-for-cyber/"
+    r"[ \t]*\n"
+    r"  Learn more: https://help\.openai\.com/en/articles/20001326[ \t]*$",
+    re.MULTILINE,
+)
+CYBER_RISK_FLAGGED_RE = re.compile(
+    r"^■ This content was flagged for possible cybersecurity risk\. "
+    r"If this seems wrong, try rephrasing your request\. To get authorized "
+    r"for security work, join the Trusted Access for Cyber program:[ \t]*\n"
+    r"https://chatgpt\.com/cyber[ \t]*$",
     re.MULTILINE,
 )
 WORKED_RE = re.compile(
@@ -204,6 +222,12 @@ def event_records(text: str) -> list[tuple[int, int, str]]:
     for match in SERVER_OVERLOADED_RE.finditer(text):
         matches.append((match.start(), match.end(), "server_overloaded"))
 
+    for match in CYBER_CONTENT_BLOCKED_RE.finditer(text):
+        matches.append((match.start(), match.end(), "cyber_content_blocked"))
+
+    for match in CYBER_RISK_FLAGGED_RE.finditer(text):
+        matches.append((match.start(), match.end(), "cyber_risk_flagged"))
+
     for match in WORKED_RE.finditer(text):
         matches.append(
             (
@@ -228,7 +252,7 @@ def terminal_suffix_is_idle(suffix: str) -> bool:
 
     if re.search(r"^›[ \t]+Continue[ \t]*$", suffix, re.MULTILINE):
         return False
-    if re.search(r"^(?:•|■|└|│)[ \t]", suffix, re.MULTILINE):
+    if re.search(r"^(?:•|■|ⓘ|└|│)[ \t]", suffix, re.MULTILINE):
         return False
     if len(re.findall(r"^›[ \t].*$", suffix, re.MULTILINE)) > 1:
         return False
@@ -1175,6 +1199,24 @@ def self_test() -> int:
                 "⚠ Selected model is at capacity. Please try a different "
                 "model.   "
             ),
+            "ⓘ This content can't be shown",
+            (
+                "  We take extra caution with cybersecurity requests. If you’re "
+                "a security professional, you may be able to apply for Trusted "
+                "Access."
+            ),
+            (
+                "  Trusted Access: "
+                "https://openai.com/form/enterprise-trusted-access-for-cyber/"
+            ),
+            "  Learn more: https://help.openai.com/en/articles/20001326",
+            (
+                "■ This content was flagged for possible cybersecurity risk. "
+                "If this seems wrong, try rephrasing your request. To get "
+                "authorized for security work, join the Trusted Access for "
+                "Cyber program:"
+            ),
+            "https://chatgpt.com/cyber",
         ]
     )
     expected = [
@@ -1184,6 +1226,8 @@ def self_test() -> int:
         "server_overloaded",
         "server_overloaded",
         "capacity",
+        "cyber_content_blocked",
+        "cyber_risk_flagged",
     ]
     assert event_signatures(retry_sample) == expected
 
@@ -1297,6 +1341,82 @@ def self_test() -> int:
         f"  ⚠ {capacity}",
     ):
         assert event_signatures(quoted_capacity) == []
+
+    content_blocked = "\n".join(
+        [
+            "ⓘ This content can't be shown",
+            (
+                "  We take extra caution with cybersecurity requests. If you’re "
+                "a security professional, you may be able to apply for Trusted "
+                "Access."
+            ),
+            (
+                "  Trusted Access: "
+                "https://openai.com/form/enterprise-trusted-access-for-cyber/"
+            ),
+            "  Learn more: https://help.openai.com/en/articles/20001326",
+        ]
+    )
+    assert event_signatures(content_blocked) == ["cyber_content_blocked"]
+    assert event_signatures(f"{content_blocked}\n{content_blocked}") == [
+        "cyber_content_blocked",
+        "cyber_content_blocked",
+    ]
+    for quoted_content_blocked in (
+        content_blocked.replace("ⓘ ", "› ⓘ ", 1),
+        content_blocked.replace("ⓘ ", "• ⓘ ", 1),
+        "\n".join(f"  {line}" for line in content_blocked.splitlines()),
+        content_blocked.splitlines()[0],
+        content_blocked.replace("you’re", "you're"),
+        content_blocked.replace("Trusted Access:", "Access:", 1),
+        content_blocked.replace("20001326", "20001327"),
+    ):
+        assert event_signatures(quoted_content_blocked) == []
+
+    current_content_blocked = f"{content_blocked}\n\n› "
+    assert terminal_event_is_current_text(
+        current_content_blocked,
+        "cyber_content_blocked",
+    )
+    assert not terminal_event_is_current_text(
+        current_content_blocked.replace("› ", "› Continue"),
+        "cyber_content_blocked",
+    )
+    assert not terminal_event_is_current_text(
+        f"{current_content_blocked}\nⓘ A later informational state",
+        "cyber_content_blocked",
+    )
+
+    cyber_risk_flagged = "\n".join(
+        [
+            (
+                "■ This content was flagged for possible cybersecurity risk. "
+                "If this seems wrong, try rephrasing your request. To get "
+                "authorized for security work, join the Trusted Access for "
+                "Cyber program:"
+            ),
+            "https://chatgpt.com/cyber",
+        ]
+    )
+    assert event_signatures(cyber_risk_flagged) == ["cyber_risk_flagged"]
+    for quoted_cyber_risk in (
+        cyber_risk_flagged.replace("■ ", "› ■ ", 1),
+        cyber_risk_flagged.replace("■ ", "• ■ ", 1),
+        "\n".join(f"  {line}" for line in cyber_risk_flagged.splitlines()),
+        cyber_risk_flagged.splitlines()[0],
+        cyber_risk_flagged.replace("rephrasing", "rewriting"),
+        cyber_risk_flagged.replace("https://chatgpt.com/cyber", "chatgpt.com/cyber"),
+    ):
+        assert event_signatures(quoted_cyber_risk) == []
+    current_cyber_risk = f"{cyber_risk_flagged}\n\n› "
+    assert terminal_event_is_current_text(
+        current_cyber_risk,
+        "cyber_risk_flagged",
+    )
+    assert not terminal_event_is_current_text(
+        current_cyber_risk.replace("› ", "› Continue"),
+        "cyber_risk_flagged",
+    )
     assert event_signatures(
         "■ An error occurred while processing\n"
         "  your request. Please include the request ID\n"

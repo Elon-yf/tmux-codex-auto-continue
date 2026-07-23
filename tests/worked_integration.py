@@ -176,6 +176,53 @@ def main() -> int:
             time.sleep(0.25)
         assert capture().count(SUBMITTED_MARKER) == 2, capture()
 
+        content_blocked = (
+            "ⓘ This content can't be shown",
+            (
+                "  We take extra caution with cybersecurity requests. If you’re "
+                "a security professional, you may be able to apply for Trusted "
+                "Access."
+            ),
+            (
+                "  Trusted Access: "
+                "https://openai.com/form/enterprise-trusted-access-for-cyber/"
+            ),
+            "  Learn more: https://help.openai.com/en/articles/20001326",
+        )
+        emit_lines(*content_blocked)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if capture().count(SUBMITTED_MARKER) == 3:
+                break
+            time.sleep(0.25)
+        assert capture().count(SUBMITTED_MARKER) == 3, capture()
+
+        # Quoted warning text must not be treated as a live Codex state.
+        emit_lines(*(f"  {line}" for line in content_blocked))
+        time.sleep(2.5)
+        assert capture().count(SUBMITTED_MARKER) == 3, capture()
+
+        cyber_risk_flagged = (
+            (
+                "■ This content was flagged for possible cybersecurity risk. "
+                "If this seems wrong, try rephrasing your request. To get "
+                "authorized for security work, join the Trusted Access for "
+                "Cyber program:"
+            ),
+            "https://chatgpt.com/cyber",
+        )
+        emit_lines(*cyber_risk_flagged)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if capture().count(SUBMITTED_MARKER) == 4:
+                break
+            time.sleep(0.25)
+        assert capture().count(SUBMITTED_MARKER) == 4, capture()
+
+        emit_lines(*(f"  {line}" for line in cyber_risk_flagged))
+        time.sleep(2.5)
+        assert capture().count(SUBMITTED_MARKER) == 4, capture()
+
         # An event that arrives while copy mode owns the pane is deferred. It
         # must not receive input in mode, but should recover after mode exits.
         first_error_id = "2b10afaf-84a8-45ee-8901-c32631c94493"
@@ -191,15 +238,15 @@ def main() -> int:
         entered_mode = tmux("copy-mode", "-t", "0")
         assert entered_mode.returncode == 0, entered_mode.stderr
         time.sleep(2.5)
-        assert capture().count(SUBMITTED_MARKER) == 2, capture()
+        assert capture().count(SUBMITTED_MARKER) == 4, capture()
         exited_mode = tmux("send-keys", "-t", "0", "-X", "cancel")
         assert exited_mode.returncode == 0, exited_mode.stderr
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            if capture().count(SUBMITTED_MARKER) == 3:
+            if capture().count(SUBMITTED_MARKER) == 5:
                 break
             time.sleep(0.25)
-        assert capture().count(SUBMITTED_MARKER) == 3, diagnostics()
+        assert capture().count(SUBMITTED_MARKER) == 5, diagnostics()
 
         # Manual recovery during the settle window makes the deferred event
         # stale. The watcher must not submit a duplicate Continue afterward.
@@ -216,12 +263,12 @@ def main() -> int:
         entered_mode = tmux("copy-mode", "-t", "0")
         assert entered_mode.returncode == 0, entered_mode.stderr
         time.sleep(2.5)
-        assert capture().count(SUBMITTED_MARKER) == 3, capture()
+        assert capture().count(SUBMITTED_MARKER) == 5, capture()
         exited_mode = tmux("send-keys", "-t", "0", "-X", "cancel")
         assert exited_mode.returncode == 0, exited_mode.stderr
         send_line("Continue")
         time.sleep(3.0)
-        assert capture().count(SUBMITTED_MARKER) == 4, capture()
+        assert capture().count(SUBMITTED_MARKER) == 6, capture()
 
         restarted = subprocess.run(
             ["python3", str(WATCHER), "--socket", socket, "--restart"],
@@ -238,6 +285,8 @@ def main() -> int:
         output = watcher_log_path.read_text()
         assert "event=worked_interrupted" in output
         assert "event=server_overloaded" in output
+        assert "event=cyber_content_blocked" in output
+        assert "event=cyber_risk_flagged" in output
         assert f"deferred error:{first_error_id}" in output
         assert "reason=pane-mode" in output
         assert "event=error" in output

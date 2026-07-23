@@ -11,17 +11,17 @@ retry states, and Codex's **Keep waiting** safety-buffering choice.
 
 ## Quick install
 
-Pinned one-line installer (v0.2.0):
+Pinned one-line installer (v0.2.1):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.2.0/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.2.1/install.sh | sh
 ```
 
 For an audit-first install, download and inspect the script before running it:
 
 ```sh
 curl -fsSLo /tmp/tmux-codex-install.sh \
-  https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.2.0/install.sh
+  https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.2.1/install.sh
 less /tmp/tmux-codex-install.sh
 sh /tmp/tmux-codex-install.sh
 ```
@@ -39,6 +39,8 @@ idempotent.
 | `■ internal streaming error, please retry` | Paste `Continue`, then send a real Enter |
 | `■ Our servers are currently overloaded. Please try again later.` | Paste `Continue`, then send a real Enter |
 | `⚠ Selected model is at capacity. Please try a different model.` | Paste `Continue`, then send a real Enter |
+| Complete `ⓘ This content can't be shown` Trusted Access notice | Paste `Continue`, then send a real Enter |
+| Complete `■ This content was flagged for possible cybersecurity risk` notice | Paste `Continue`, then send a real Enter |
 | Active `Additional safety checks` menu, Retry selected | Down, verify `Keep waiting`, then Enter |
 | Active menu, `Keep waiting` already selected | Enter only |
 | `─ Worked for ... ─` directly after a recognized Codex activity block, with no final-response boundary | Paste `Continue`, then send a real Enter |
@@ -46,6 +48,9 @@ idempotent.
 
 The two-item safety menu (without a faster-model retry choice) is also handled:
 when `Keep waiting` is already the first selected item, only Enter is sent.
+Each newly rendered supported cybersecurity notice is treated as a new retry
+event. If the same notice keeps recurring, use `prefix` + `A` to stop automatic
+retries.
 
 Normal completed turns are always ignored. For a `Worked for` marker, the
 watcher looks for Codex's final-response boundary immediately before the last
@@ -71,6 +76,10 @@ The watcher fails closed and sends input only after all relevant checks pass:
   matching. A `Worked for` interruption also requires a recent recognized
   activity block; normal final-response boundaries and unknown layouts are
   recorded only to cancel stale work and never trigger input.
+- Cybersecurity notices require the complete rendered block: four exact
+  logical lines and both official URLs for the `ⓘ` notice, or two exact logical
+  lines and the Trusted Access URL for the `■` notice. A header alone, quoted
+  text, indentation, changed wording, or a changed URL does not match.
 - Interactive menus are read from the current viewport only, never historical
   scrollback. The exact title, complete explanatory text, numbered rows,
   selected marker, and footer must match, and the footer must be the final
@@ -98,7 +107,7 @@ No tmux session or pane is created, renamed, closed, or killed.
 - Codex CLI installed from the npm `@openai/codex` package
 - UTF-8 terminal and the English Codex UI
 
-v0.2.0 is tested with Codex CLI 0.144.5, plus isolated tmux integrations
+v0.2.1 is tested with Codex CLI 0.144.5, plus isolated tmux integrations
 using a native fake-Codex process. Codex UI wording and layout may change in
 later releases; unknown layouts are ignored rather than matched loosely.
 macOS, Homebrew/standalone Codex binaries, localized UI text, and non-Linux
@@ -149,7 +158,7 @@ are stored at `~/.cache/tmux-codex-auto-continue.log`. A separate tmux socket
 
 ## Update and uninstall
 
-Re-run the pinned v0.2.0 installer to update. It replaces only the verified
+Re-run the pinned v0.2.1 installer to update. It replaces only the verified
 watcher process for the default tmux socket; it does not restart the tmux
 server or any pane. The installer removes the obsolete v0.1.x Worked opt-in
 from its marked configuration block and unsets that legacy live option.
@@ -164,7 +173,7 @@ After manually replacing the executable, reload it safely with:
 To remove a curl installation:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.2.0/uninstall.sh | sh
+curl -fsSL https://raw.githubusercontent.com/yeahdongcn/tmux-codex-auto-continue/v0.2.1/uninstall.sh | sh
 ```
 
 The uninstaller disables the watcher, cleans up the obsolete v0.1.x option,
@@ -189,10 +198,11 @@ ruff check tests/install_integration.py
 shellcheck install.sh uninstall.sh tmux-codex-auto-continue.tmux
 ```
 
-The built-in tests cover error and interruption signatures, normal and unknown
-`Worked for` rejection, three-item and two-item menu parsing, selected rows,
-and quoted/stale prompt rejection. The integration test uses an isolated tmux
-server and a native fake-Codex process to verify normal-completion suppression,
+The built-in tests cover error, interruption, and complete cybersecurity-notice
+signatures, normal and unknown `Worked for` rejection, three-item and two-item
+menu parsing, selected rows, and quoted/stale prompt rejection. The integration
+test uses an isolated tmux server and a native fake-Codex process to verify
+normal-completion suppression, both strict cybersecurity-notice paths,
 history-backed interrupted-turn recovery, quoted-line rejection, bounded
 pane-mode recovery, manual-recovery deduplication, and watcher-only restart.
 The installer integration verifies fresh configuration and legacy-option
