@@ -24,7 +24,7 @@ POLL_INTERVAL_SECONDS = 0.5
 SETTLE_SECONDS = 1.5
 MIN_SEND_GAP_SECONDS = 2.0
 DEFERRED_EVENT_TTL_SECONDS = 30.0
-CONTEXT_COMPACTION_TTL_SECONDS = 60.0
+CONTEXT_COMPACTION_TTL_SECONDS = 5 * 60.0
 MIN_MENU_ATTEMPT_GAP_SECONDS = 2.0
 MENU_REDRAW_TIMEOUT_SECONDS = 0.75
 MENU_REDRAW_POLL_SECONDS = 0.05
@@ -35,7 +35,7 @@ REPLY = "Continue"
 COMPACT_COMMAND = "/compact"
 OPTION_NAME = "@codex-auto-continue"
 EMPTY_COMPOSER_CURSOR_X = 2
-VERSION = "0.2.5"
+VERSION = "0.2.6"
 
 # Requiring Codex's exact event glyph and structure in column zero avoids
 # matching quoted text in user prompts, assistant messages, or shell output.
@@ -1960,6 +1960,25 @@ def self_test() -> int:
         [first_error],
         [first_error, second_error],
     ) == [second_error]
+
+    # A real compaction can take longer than one minute. Keep the watcher-owned
+    # phase alive for the observed 67-second case while retaining a finite
+    # five-minute boundary for a compaction that never completes.
+    delayed_compaction = PaneState(
+        "test-process",
+        [],
+        (80, 24),
+        awaiting_context_compacted=True,
+        context_compaction_started=100.0,
+    )
+    assert CONTEXT_COMPACTION_TTL_SECONDS == 300.0
+    assert not expire_compaction_wait(
+        delayed_compaction,
+        167.024,
+        "%0",
+        "test",
+    )
+    assert delayed_compaction.awaiting_context_compacted
     print("self-test: PASS")
     return 0
 

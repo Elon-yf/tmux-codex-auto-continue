@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.6 - 2026-07-25
+
+- Extend the guarded context-compaction confirmation window from one minute to
+  five minutes so slow compactions can still complete the two-stage recovery.
+- Preserve the existing finite timeout and all superseding-event, manual-input,
+  process-identity, pane-mode, and live-terminal revalidation safeguards.
+- Add regression coverage that keeps the watcher-owned compaction phase active
+  at the observed 67-second delay.
+
 ## v0.2.5 - 2026-07-25
 
 - Pin Ruff in GitHub Actions and define the repository's stable lint rule set
