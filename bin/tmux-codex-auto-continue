@@ -11,15 +11,14 @@ import argparse
 import fcntl
 import hashlib
 import os
-from dataclasses import dataclass, field
-from pathlib import Path
 import re
 import shlex
 import signal
 import subprocess
 import sys
 import time
-
+from dataclasses import dataclass, field
+from pathlib import Path
 
 POLL_INTERVAL_SECONDS = 0.5
 SETTLE_SECONDS = 1.5
@@ -36,7 +35,7 @@ REPLY = "Continue"
 COMPACT_COMMAND = "/compact"
 OPTION_NAME = "@codex-auto-continue"
 EMPTY_COMPOSER_CURSOR_X = 2
-VERSION = "0.2.4"
+VERSION = "0.2.5"
 
 # Requiring Codex's exact event glyph and structure in column zero avoids
 # matching quoted text in user prompts, assistant messages, or shell output.

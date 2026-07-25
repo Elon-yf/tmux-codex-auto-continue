@@ -4,13 +4,12 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import shlex
 import shutil
 import subprocess
 import tempfile
 import time
-
+from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 INSTALLER = ROOT / "install.sh"

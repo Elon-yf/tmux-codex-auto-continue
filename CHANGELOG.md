@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.5 - 2026-07-25
+
+- Pin Ruff in GitHub Actions and define the repository's stable lint rule set
+  so upstream default-rule changes cannot break otherwise unchanged releases.
+- Apply Ruff's import ordering with no runtime behavior changes.
+
 ## v0.2.4 - 2026-07-25
 
 - Add guarded two-stage recovery for strict context-size 413 diagnostics:
