@@ -25,6 +25,7 @@ POLL_INTERVAL_SECONDS = 0.5
 SETTLE_SECONDS = 1.5
 MIN_SEND_GAP_SECONDS = 2.0
 DEFERRED_EVENT_TTL_SECONDS = 30.0
+CONTEXT_COMPACTION_TTL_SECONDS = 60.0
 MIN_MENU_ATTEMPT_GAP_SECONDS = 2.0
 MENU_REDRAW_TIMEOUT_SECONDS = 0.75
 MENU_REDRAW_POLL_SECONDS = 0.05
@@ -32,9 +33,10 @@ DAEMON_RESTART_TIMEOUT_SECONDS = 3.0
 CAPTURE_HISTORY_LINES = 400
 MAX_ACTIVITY_TO_WORKED_LINES = 120
 REPLY = "Continue"
+COMPACT_COMMAND = "/compact"
 OPTION_NAME = "@codex-auto-continue"
 EMPTY_COMPOSER_CURSOR_X = 2
-VERSION = "0.2.3"
+VERSION = "0.2.4"
 
 # Requiring Codex's exact event glyph and structure in column zero avoids
 # matching quoted text in user prompts, assistant messages, or shell output.
@@ -53,6 +55,14 @@ STREAMING_ERROR_RE = re.compile(
 SERVER_OVERLOADED_RE = re.compile(
     r"^■ Our servers are currently overloaded\. Please try again later\."
     r"(?:[ \t]+---)?[ \t]*$",
+    re.MULTILINE,
+)
+CONTEXT_TOO_LARGE_HEADER_RE = re.compile(
+    r"^■ unexpected status 413 Payload Too Large:[ \t]*.*$",
+    re.MULTILINE,
+)
+CONTEXT_COMPACTED_RE = re.compile(
+    r"^• Context compacted(?:[ \t].*)?[ \t]*$",
     re.MULTILINE,
 )
 CYBER_CONTENT_BLOCKED_RE = re.compile(
@@ -89,7 +99,16 @@ CODEX_ACTIVITY_BULLET_RE = re.compile(
 WORKED_INTERRUPTED = "worked_interrupted"
 WORKED_COMPLETE = "worked_complete"
 WORKED_UNKNOWN = "worked_unknown"
-NON_ACTIONABLE_EVENTS = frozenset({WORKED_COMPLETE, WORKED_UNKNOWN})
+CONTEXT_TOO_LARGE = "context_too_large"
+CONTEXT_COMPACTED = "context_compacted"
+NON_ACTIONABLE_EVENTS = frozenset(
+    {WORKED_COMPLETE, WORKED_UNKNOWN, CONTEXT_COMPACTED}
+)
+CONTEXT_TOO_LARGE_REQUIRED_TOKENS = (
+    "request_too_large",
+    "Conversation context is too large",
+    "auto-compaction is not reducing",
+)
 SAFETY_MENU_HEADER_RE = re.compile(
     r"^  Additional safety checks[ \t]*$",
 )
@@ -128,6 +147,11 @@ class PaneState:
     pending_events: set[str] = field(default_factory=set)
     pending_deferred_events: set[str] = field(default_factory=set)
     deferred_events: dict[str, float] = field(default_factory=dict)
+    pending_reply: str | None = None
+    awaiting_context_compacted: bool = False
+    context_compacted_seen: bool = False
+    context_retry_seen: bool = False
+    context_compaction_started: float = 0.0
     send_after: float = 0.0
     last_sent: float = 0.0
     last_menu_attempt: float = 0.0
@@ -193,6 +217,40 @@ def classify_worked(text: str, worked_start: int) -> str:
     return WORKED_UNKNOWN
 
 
+def context_too_large_records(text: str) -> list[tuple[int, int, str]]:
+    """Return strict, bounded matches for the internal 413 context error."""
+
+    matches: list[tuple[int, int, str]] = []
+    event_line_re = re.compile(r"^[■─›•ⓘ⚠](?: |$)")
+
+    for header in CONTEXT_TOO_LARGE_HEADER_RE.finditer(text):
+        block = [header.group(0)]
+        block_end = header.end()
+        tail = text[header.end() :]
+        if tail.startswith("\r\n"):
+            tail = tail[2:]
+            block_end += 2
+        elif tail.startswith("\n"):
+            tail = tail[1:]
+            block_end += 1
+
+        # capture-pane -J normally rejoins terminal wrapping. Keep a small
+        # continuation allowance for proxies or renderers that emit logical
+        # newlines inside the diagnostic itself.
+        for raw_line in tail.splitlines(keepends=True)[:20]:
+            line = raw_line.rstrip("\r\n")
+            if not line.strip() or event_line_re.match(line):
+                break
+            block.append(line)
+            block_end += len(raw_line)
+
+        normalized = re.sub(r"\s+", " ", " ".join(block))
+        if all(token in normalized for token in CONTEXT_TOO_LARGE_REQUIRED_TOKENS):
+            matches.append((header.start(), block_end, CONTEXT_TOO_LARGE))
+
+    return matches
+
+
 def event_records(text: str) -> list[tuple[int, int, str]]:
     """Return ordered matches with source spans and normalized signatures."""
 
@@ -222,6 +280,11 @@ def event_records(text: str) -> list[tuple[int, int, str]]:
     for match in SERVER_OVERLOADED_RE.finditer(text):
         matches.append((match.start(), match.end(), "server_overloaded"))
 
+    matches.extend(context_too_large_records(text))
+
+    for match in CONTEXT_COMPACTED_RE.finditer(text):
+        matches.append((match.start(), match.end(), CONTEXT_COMPACTED))
+
     for match in CYBER_CONTENT_BLOCKED_RE.finditer(text):
         matches.append((match.start(), match.end(), "cyber_content_blocked"))
 
@@ -250,13 +313,24 @@ def event_signatures(text: str) -> list[str]:
 def terminal_suffix_is_idle(suffix: str) -> bool:
     """Return whether no later submitted prompt or Codex output is visible."""
 
-    if re.search(r"^›[ \t]+Continue[ \t]*$", suffix, re.MULTILINE):
+    if re.search(
+        r"^›[ \t]+(?:Continue|/compact)[ \t]*$",
+        suffix,
+        re.MULTILINE,
+    ):
         return False
     if re.search(r"^(?:•|■|ⓘ|└|│)[ \t]", suffix, re.MULTILINE):
         return False
     if len(re.findall(r"^›[ \t].*$", suffix, re.MULTILINE)) > 1:
         return False
     return True
+
+
+def composer_has_visible_input(text: str) -> bool:
+    """Return whether the bottom composer visibly contains user text."""
+
+    lines = text.rstrip("\n").splitlines()
+    return bool(lines and re.match(r"^›[ \t]+\S", lines[-1]))
 
 
 def terminal_event_is_current_text(
@@ -273,6 +347,30 @@ def terminal_event_is_current_text(
         else text
     )
     records = event_records(validation_text)
+    if event == CONTEXT_COMPACTED:
+        if CONTEXT_COMPACTED_RE.search(text) is None:
+            return False
+        marker_indices = [
+            index
+            for index, record in enumerate(records)
+            if record[2] == CONTEXT_COMPACTED
+        ]
+        if not marker_indices:
+            return False
+        marker_index = marker_indices[-1]
+        allowed_trailers = {
+            WORKED_INTERRUPTED,
+            WORKED_COMPLETE,
+            WORKED_UNKNOWN,
+        }
+        if any(
+            record[2] not in allowed_trailers
+            for record in records[marker_index + 1 :]
+        ):
+            return False
+        marker_end = records[marker_index][1]
+        return terminal_suffix_is_idle(validation_text[marker_end:])
+
     if not records or records[-1][2] != event:
         return False
 
@@ -626,7 +724,22 @@ def option_enabled(socket: str) -> bool:
 def clear_pending(state: PaneState) -> None:
     state.pending_events.clear()
     state.pending_deferred_events.clear()
+    state.pending_reply = None
     state.send_after = 0.0
+
+
+def clear_compaction_wait(state: PaneState) -> None:
+    state.awaiting_context_compacted = False
+    state.context_compacted_seen = False
+    state.context_retry_seen = False
+    state.context_compaction_started = 0.0
+    state.deferred_events.pop(CONTEXT_COMPACTED, None)
+
+
+def reply_for_events(events: list[str]) -> str:
+    if events and events[-1] == CONTEXT_TOO_LARGE:
+        return COMPACT_COMMAND
+    return REPLY
 
 
 def schedule_pending(
@@ -635,9 +748,11 @@ def schedule_pending(
     now: float,
     *,
     deferred: bool,
+    reply: str | None = None,
 ) -> None:
     state.pending_events = set(events)
     state.pending_deferred_events = set(events) if deferred else set()
+    state.pending_reply = reply if reply is not None else reply_for_events(events)
     state.send_after = max(
         now + SETTLE_SECONDS,
         state.last_sent + MIN_SEND_GAP_SECONDS,
@@ -678,14 +793,32 @@ def expire_deferred_events(
         clear_pending(state)
 
 
-def send_continue(
+def expire_compaction_wait(
+    state: PaneState, now: float, pane: str, session: str
+) -> bool:
+    if not state.awaiting_context_compacted:
+        return False
+    if now - state.context_compaction_started <= CONTEXT_COMPACTION_TTL_SECONDS:
+        return False
+    retry_context = state.context_retry_seen
+    clear_pending(state)
+    clear_compaction_wait(state)
+    log(
+        f"expired context-compaction wait for pane {pane} ({session}) "
+        f"after {CONTEXT_COMPACTION_TTL_SECONDS:.0f}s"
+    )
+    return retry_context
+
+
+def submit_text(
     socket: str,
     pane: str,
     pane_pid: int,
     process_identity: str,
     expected_events: set[str],
+    reply: str,
 ) -> bool:
-    """Paste the reply explicitly, then submit it with a real Enter key.
+    """Paste text explicitly, then submit it with a real Enter key.
 
     Codex treats a rapid sequence of ordinary character key events as a paste
     burst. If Enter arrives during that burst, it inserts a newline instead of
@@ -733,7 +866,7 @@ def send_continue(
         "-b",
         buffer_name,
         "--",
-        REPLY,
+        reply,
         ";",
         "paste-buffer",
         "-p",
@@ -905,6 +1038,13 @@ def run_daemon(socket: str) -> int:
                 continue
 
             if state.geometry != geometry:
+                resized_events = appended_events(state.events, events)
+                if (
+                    state.awaiting_context_compacted
+                    and CONTEXT_COMPACTED in resized_events
+                ):
+                    state.context_compacted_seen = True
+                    state.context_compaction_started = now
                 state.events = events
                 state.geometry = geometry
                 clear_pending(state)
@@ -923,12 +1063,22 @@ def run_daemon(socket: str) -> int:
             else:
                 state.safety_menu_absent_polls = 0
 
+            expire_deferred_events(state, now, pane, session)
+            retry_expired_context = False
+            if not (
+                state.awaiting_context_compacted
+                and CONTEXT_COMPACTED in new_events
+            ):
+                retry_expired_context = expire_compaction_wait(
+                    state, now, pane, session
+                )
+            if retry_expired_context and CONTEXT_TOO_LARGE not in new_events:
+                new_events.append(CONTEXT_TOO_LARGE)
             actionable_events = [
                 event
                 for event in new_events
                 if event not in NON_ACTIONABLE_EVENTS
             ]
-            expire_deferred_events(state, now, pane, session)
 
             # Disabling the watcher remains a hard boundary: do not replay
             # anything observed while it was off when it is enabled again.
@@ -936,6 +1086,7 @@ def run_daemon(socket: str) -> int:
                 if menu_selection is not None:
                     state.safety_menu_latched = True
                 clear_pending(state)
+                clear_compaction_wait(state)
                 state.deferred_events.clear()
                 continue
 
@@ -943,23 +1094,84 @@ def run_daemon(socket: str) -> int:
             # Keep newly observed terminal events for a short, bounded window,
             # then revalidate them against the live viewport after mode exits.
             if in_mode:
-                if new_events:
+                if state.awaiting_context_compacted:
+                    if CONTEXT_COMPACTED in new_events:
+                        state.context_compacted_seen = True
+                        state.context_compaction_started = now
+                        marker_index = (
+                            len(new_events)
+                            - 1
+                            - new_events[::-1].index(CONTEXT_COMPACTED)
+                        )
+                        post_marker_events = [
+                            event
+                            for event in new_events[marker_index + 1 :]
+                            if event not in NON_ACTIONABLE_EVENTS
+                        ]
+                        defer_events(
+                            state,
+                            [CONTEXT_COMPACTED, *post_marker_events],
+                            now,
+                            pane,
+                            session,
+                            "pane-mode",
+                        )
+                    elif state.context_compacted_seen:
+                        defer_events(
+                            state,
+                            (
+                                actionable_events
+                                if new_events
+                                else list(state.pending_events)
+                            ),
+                            now,
+                            pane,
+                            session,
+                            "pane-mode",
+                        )
+                    else:
+                        replacement_events = [
+                            event
+                            for event in actionable_events
+                            if event != CONTEXT_TOO_LARGE
+                        ]
+                        if replacement_events:
+                            clear_compaction_wait(state)
+                            state.deferred_events.clear()
+                            defer_events(
+                                state,
+                                replacement_events,
+                                now,
+                                pane,
+                                session,
+                                "pane-mode",
+                            )
+                        elif CONTEXT_TOO_LARGE in actionable_events:
+                            state.context_retry_seen = True
+                        elif new_events:
+                            clear_compaction_wait(state)
+                            state.deferred_events.clear()
                     clear_pending(state)
-                    state.deferred_events.clear()
-                defer_events(
-                    state,
-                    (
-                        actionable_events
-                        if new_events
-                        else list(state.pending_events)
-                    ),
-                    now,
-                    pane,
-                    session,
-                    "pane-mode",
-                )
+                else:
+                    if new_events:
+                        clear_pending(state)
+                        state.deferred_events.clear()
+                    defer_events(
+                        state,
+                        (
+                            actionable_events
+                            if new_events
+                            else list(state.pending_events)
+                        ),
+                        now,
+                        pane,
+                        session,
+                        "pane-mode",
+                    )
                 if menu_selection is not None:
                     state.safety_menu_latched = True
+                    clear_compaction_wait(state)
+                    state.deferred_events.clear()
                 clear_pending(state)
                 continue
 
@@ -967,6 +1179,7 @@ def run_daemon(socket: str) -> int:
                 # A live selection view owns the keyboard; never fall through
                 # to composer-oriented error recovery while it is visible.
                 clear_pending(state)
+                clear_compaction_wait(state)
                 state.deferred_events.clear()
                 if (
                     menu_selection in {"retry", "wait"}
@@ -989,7 +1202,76 @@ def run_daemon(socket: str) -> int:
                         )
                 continue
 
-            if new_events:
+            if state.awaiting_context_compacted:
+                if CONTEXT_COMPACTED in new_events:
+                    state.context_compacted_seen = True
+                    state.context_compaction_started = now
+                    marker_index = len(new_events) - 1 - new_events[::-1].index(
+                        CONTEXT_COMPACTED
+                    )
+                    post_marker_events = [
+                        event
+                        for event in new_events[marker_index + 1 :]
+                        if event not in NON_ACTIONABLE_EVENTS
+                    ]
+                    clear_pending(state)
+                    schedule_pending(
+                        state,
+                        [CONTEXT_COMPACTED, *post_marker_events],
+                        now,
+                        deferred=(
+                            CONTEXT_COMPACTED in state.deferred_events
+                        ),
+                        reply=REPLY,
+                    )
+                elif state.context_compacted_seen:
+                    if actionable_events:
+                        clear_pending(state)
+                        schedule_pending(
+                            state,
+                            actionable_events,
+                            now,
+                            deferred=False,
+                            reply=REPLY,
+                        )
+                    elif not state.pending_events:
+                        deferred_after_marker = [
+                            event
+                            for event in state.deferred_events
+                            if event not in NON_ACTIONABLE_EVENTS
+                        ]
+                        schedule_pending(
+                            state,
+                            [CONTEXT_COMPACTED, *deferred_after_marker],
+                            now,
+                            deferred=(
+                                CONTEXT_COMPACTED in state.deferred_events
+                            ),
+                            reply=REPLY,
+                        )
+                else:
+                    replacement_events = [
+                        event
+                        for event in actionable_events
+                        if event != CONTEXT_TOO_LARGE
+                    ]
+                    if replacement_events:
+                        clear_pending(state)
+                        clear_compaction_wait(state)
+                        state.deferred_events.clear()
+                        schedule_pending(
+                            state,
+                            replacement_events,
+                            now,
+                            deferred=False,
+                        )
+                    elif CONTEXT_TOO_LARGE in actionable_events:
+                        state.context_retry_seen = True
+                    elif new_events:
+                        clear_pending(state)
+                        clear_compaction_wait(state)
+                        state.deferred_events.clear()
+            elif new_events:
                 # Every new terminal marker supersedes older pending state.
                 # Normal and unknown Worked layouts are deliberately tracked
                 # but never scheduled, so they also cancel a stale retry.
@@ -1003,8 +1285,17 @@ def run_daemon(socket: str) -> int:
                         deferred=False,
                     )
             elif not state.pending_events and state.deferred_events:
+                deferred_candidates = [
+                    event
+                    for event in state.deferred_events
+                    if event not in NON_ACTIONABLE_EVENTS
+                ]
+                for event in set(state.deferred_events) - set(
+                    deferred_candidates
+                ):
+                    state.deferred_events.pop(event, None)
                 current_events = current_terminal_events(
-                    socket, pane, list(state.deferred_events)
+                    socket, pane, deferred_candidates
                 )
                 if current_events:
                     schedule_pending(
@@ -1036,6 +1327,7 @@ def run_daemon(socket: str) -> int:
                 continue
             if not option_enabled(socket):
                 clear_pending(state)
+                clear_compaction_wait(state)
                 state.deferred_events.clear()
                 continue
             current_events = current_terminal_events(
@@ -1044,6 +1336,12 @@ def run_daemon(socket: str) -> int:
                 state.pending_events,
             )
             if not current_events:
+                if (
+                    state.awaiting_context_compacted
+                    and state.context_compacted_seen
+                ):
+                    clear_compaction_wait(state)
+                    state.deferred_events.clear()
                 clear_pending(state)
                 continue
             state.pending_events.intersection_update(current_events)
@@ -1053,6 +1351,32 @@ def run_daemon(socket: str) -> int:
             # empty composer. Convert that one-shot miss into the same bounded,
             # revalidated recovery path used for copy mode.
             if pane_cursor_x(socket, pane) != EMPTY_COMPOSER_CURSOR_X:
+                if (
+                    state.awaiting_context_compacted
+                    and state.context_compacted_seen
+                ):
+                    visible_text = capture_visible_text(socket, pane)
+                    if visible_text is not None and composer_has_visible_input(
+                        visible_text
+                    ):
+                        log(
+                            f"canceled context-compaction continuation for "
+                            f"pane {pane} ({session}); composer has user input"
+                        )
+                        clear_pending(state)
+                        clear_compaction_wait(state)
+                        state.deferred_events.clear()
+                        continue
+                    defer_events(
+                        state,
+                        list(state.pending_events),
+                        now,
+                        pane,
+                        session,
+                        "composer-not-ready",
+                    )
+                    clear_pending(state)
+                    continue
                 if not state.pending_deferred_events:
                     current_events = current_terminal_events(
                         socket,
@@ -1073,16 +1397,39 @@ def run_daemon(socket: str) -> int:
             kinds = ",".join(
                 sorted(event.partition(":")[0] for event in state.pending_events)
             )
+            reply = state.pending_reply or REPLY
             pending_deferred = set(state.pending_deferred_events)
-            if send_continue(
+            pending_events = set(state.pending_events)
+            if submit_text(
                 socket,
                 pane,
                 pane_pid,
                 process_identity,
                 state.pending_events,
+                reply,
             ):
                 state.last_sent = time.monotonic()
-                log(f"sent Continue to pane {pane} ({session}); event={kinds}")
+                if reply == COMPACT_COMMAND:
+                    clear_compaction_wait(state)
+                    state.awaiting_context_compacted = True
+                    state.context_compaction_started = state.last_sent
+                    log(
+                        f"sent /compact to pane {pane} ({session}); "
+                        f"event={kinds}"
+                    )
+                else:
+                    log(
+                        f"sent Continue to pane {pane} ({session}); "
+                        f"event={kinds}"
+                    )
+                    if (
+                        CONTEXT_COMPACTED in pending_events
+                        or (
+                            state.awaiting_context_compacted
+                            and state.context_compacted_seen
+                        )
+                    ):
+                        clear_compaction_wait(state)
                 if pending_deferred:
                     state.deferred_events.clear()
             clear_pending(state)
@@ -1305,7 +1652,10 @@ def self_test() -> int:
             "  └ tool output\n\n"
             "─ Worked for 2h 00m 20s ─────────────────\n\n› "
         )
-        assert event_signatures(fixture) == [WORKED_INTERRUPTED], activity
+        expected_activity_events = [WORKED_INTERRUPTED]
+        if activity == "Context compacted":
+            expected_activity_events.insert(0, CONTEXT_COMPACTED)
+        assert event_signatures(fixture) == expected_activity_events, activity
     assert event_signatures(
         "  ─ Worked for 15m 36s ─────\n"
         "  ■ An error occurred while processing your request."
@@ -1341,6 +1691,88 @@ def self_test() -> int:
         f"  ⚠ {capacity}",
     ):
         assert event_signatures(quoted_capacity) == []
+
+    context_too_large = (
+        "■ unexpected status 413 Payload Too Large: "
+        "{'error': 'request_too_large', 'message_en': 'Conversation context "
+        "is too large (request body 952599B > 1MB upstream limit) and "
+        "auto-compaction is not reducing it.', 'body_bytes': 952599, "
+        "'limit_bytes': 950000}"
+    )
+    assert event_signatures(context_too_large) == [CONTEXT_TOO_LARGE]
+    wrapped_context_too_large = (
+        "■ unexpected status 413 Payload Too Large: "
+        "{'error': 'request_too_large',\n"
+        "  'message_en': 'Conversation context is too large and "
+        "auto-compaction\n"
+        "  is not reducing it.', 'body_bytes': 1234567}\n\n› "
+    )
+    assert event_signatures(wrapped_context_too_large) == [CONTEXT_TOO_LARGE]
+    for quoted_or_incomplete_context_error in (
+        context_too_large.removeprefix("■ "),
+        f"› {context_too_large}",
+        f"• {context_too_large}",
+        f"  {context_too_large}",
+        context_too_large.replace("status 413", "status 400", 1),
+        context_too_large.replace("request_too_large", "bad_request", 1),
+        context_too_large.replace(
+            "Conversation context is too large",
+            "Conversation input is too large",
+            1,
+        ),
+        context_too_large.replace(
+            "auto-compaction is not reducing",
+            "automatic reduction failed",
+            1,
+        ),
+        "■ unexpected status 413 Payload Too Large:",
+    ):
+        assert event_signatures(quoted_or_incomplete_context_error) == []
+
+    assert event_signatures("• Context compacted") == [CONTEXT_COMPACTED]
+    assert event_signatures("• Context compacted successfully") == [
+        CONTEXT_COMPACTED
+    ]
+    for quoted_context_compacted in (
+        "Context compacted",
+        "› • Context compacted",
+        "  • Context compacted",
+    ):
+        assert event_signatures(quoted_context_compacted) == []
+    assert not composer_has_visible_input("• Context compacted\n\n› ")
+    assert not composer_has_visible_input("• Context compacted\n")
+    assert composer_has_visible_input("• Context compacted\n\n› manual text")
+    current_context_compacted = "• Context compacted\n\n› "
+    assert terminal_event_is_current_text(
+        current_context_compacted,
+        CONTEXT_COMPACTED,
+    )
+    assert not terminal_event_is_current_text(
+        current_context_compacted.replace("› ", "› Continue"),
+        CONTEXT_COMPACTED,
+    )
+    assert not terminal_event_is_current_text(
+        f"{current_context_compacted}\n• Later output",
+        CONTEXT_COMPACTED,
+    )
+    compacted_with_worked_trailer = (
+        "previous activity\n\n"
+        "• Context compacted\n\n"
+        "─ Worked for 0m 01s ───────────────\n\n› "
+    )
+    assert terminal_event_is_current_text(
+        compacted_with_worked_trailer,
+        CONTEXT_COMPACTED,
+    )
+    current_context_error = f"{context_too_large}\n\n› "
+    assert terminal_event_is_current_text(
+        current_context_error,
+        CONTEXT_TOO_LARGE,
+    )
+    assert not terminal_event_is_current_text(
+        current_context_error.replace("› ", "› /compact"),
+        CONTEXT_TOO_LARGE,
+    )
 
     content_blocked = "\n".join(
         [

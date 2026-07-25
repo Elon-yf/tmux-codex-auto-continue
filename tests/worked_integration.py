@@ -16,6 +16,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 WATCHER = ROOT / "bin" / "tmux-codex-auto-continue"
 SUBMITTED_MARKER = "__CONTINUE_SUBMITTED__"
+COMPACT_SUBMITTED_MARKER = "__COMPACT_SUBMITTED__"
 
 
 def main() -> int:
@@ -34,7 +35,9 @@ def main() -> int:
     bash_rc = temporary_root / "bashrc"
     bash_rc.write_text(
         "PS1='› '\n"
-        f"Continue() {{ printf '%s\\n' {SUBMITTED_MARKER}; }}\n",
+        f"Continue() {{ printf '%s\\n' {SUBMITTED_MARKER}; }}\n"
+        "trap 'if [[ \"$BASH_COMMAND\" == \"/compact\" ]]; then "
+        f"printf \"%s\\\\n\" {COMPACT_SUBMITTED_MARKER}; fi' DEBUG\n",
         encoding="utf-8",
     )
 
@@ -57,7 +60,7 @@ def main() -> int:
         )
 
     def capture() -> str:
-        return tmux("capture-pane", "-p", "-S", "-100", "-t", "0").stdout
+        return tmux("capture-pane", "-p", "-S", "-1000", "-t", "0").stdout
 
     def send_line(line: str) -> None:
         typed = tmux("send-keys", "-t", "0", "-l", line)
@@ -223,6 +226,115 @@ def main() -> int:
         time.sleep(2.5)
         assert capture().count(SUBMITTED_MARKER) == 4, capture()
 
+        # A compaction marker is never actionable unless this watcher first
+        # submitted /compact for the strict 413 context error.
+        emit_lines("• Context compacted")
+        time.sleep(2.5)
+        assert capture().count(COMPACT_SUBMITTED_MARKER) == 0, diagnostics()
+        assert capture().count(SUBMITTED_MARKER) == 4, diagnostics()
+
+        context_too_large = (
+            "■ unexpected status 413 Payload Too Large: "
+            "{'error': 'request_too_large', 'message_en': 'Conversation "
+            "context is too large (request body 952599B > 1MB upstream limit) "
+            "and auto-compaction is not reducing it.', 'body_bytes': 952599, "
+            "'limit_bytes': 950000}"
+        )
+        emit_lines(context_too_large)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if capture().count(COMPACT_SUBMITTED_MARKER) == 1:
+                break
+            time.sleep(0.25)
+        assert capture().count(COMPACT_SUBMITTED_MARKER) == 1, diagnostics()
+        assert capture().count(SUBMITTED_MARKER) == 4, diagnostics()
+
+        # Repeating the same 413 while /compact is in flight must not submit a
+        # second command. The next new compaction marker completes the phase.
+        emit_lines(context_too_large.replace("952599", "952600"))
+        time.sleep(2.5)
+        assert capture().count(COMPACT_SUBMITTED_MARKER) == 1, diagnostics()
+        send_line(
+            "(sleep 0.2; printf '\\r%s\\n' "
+            + shlex.quote("• Context compacted")
+            + "; sleep 1; printf '%s\\n' "
+            + shlex.quote("─ Worked for 0m 02s ───────────────")
+            + "; sleep 2; printf '› ') &"
+        )
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if capture().count(SUBMITTED_MARKER) == 5:
+                break
+            time.sleep(0.25)
+        assert capture().count(SUBMITTED_MARKER) == 5, diagnostics()
+
+        # The completed phase is latched off; a repeated marker or a quoted
+        # context error must not inject more input.
+        emit_lines("• Context compacted", f"  {context_too_large}")
+        time.sleep(2.5)
+        assert capture().count(COMPACT_SUBMITTED_MARKER) == 1, diagnostics()
+        assert capture().count(SUBMITTED_MARKER) == 5, diagnostics()
+
+        # A different retryable terminal error replaces an unfinished
+        # compaction phase instead of being consumed and lost.
+        emit_lines(context_too_large.replace("952599", "952602"))
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if capture().count(COMPACT_SUBMITTED_MARKER) == 2:
+                break
+            time.sleep(0.25)
+        assert capture().count(COMPACT_SUBMITTED_MARKER) == 2, diagnostics()
+        emit_lines(
+            "■ Our servers are currently overloaded. Please try again later."
+        )
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if capture().count(SUBMITTED_MARKER) == 6:
+                break
+            time.sleep(0.25)
+        assert capture().count(SUBMITTED_MARKER) == 6, diagnostics()
+        emit_lines("• Context compacted")
+        time.sleep(2.5)
+        assert capture().count(SUBMITTED_MARKER) == 6, diagnostics()
+
+        # If compaction finishes while copy mode owns the pane, keep the
+        # confirmation bounded and revalidate it only after copy mode exits.
+        emit_lines(context_too_large.replace("952599", "952601"))
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if capture().count(COMPACT_SUBMITTED_MARKER) == 3:
+                break
+            time.sleep(0.25)
+        assert capture().count(COMPACT_SUBMITTED_MARKER) == 3, diagnostics()
+        resized = tmux(
+            "resize-window",
+            "-t",
+            "0",
+            "-x",
+            "100",
+            "-y",
+            "22",
+        )
+        assert resized.returncode == 0, resized.stderr
+        time.sleep(1.0)
+        send_line(
+            "(sleep 1; printf '\\r%s\\n› ' "
+            + shlex.quote("• Context compacted")
+            + ") &"
+        )
+        entered_mode = tmux("copy-mode", "-t", "0")
+        assert entered_mode.returncode == 0, entered_mode.stderr
+        time.sleep(2.5)
+        assert capture().count(SUBMITTED_MARKER) == 6, diagnostics()
+        exited_mode = tmux("send-keys", "-t", "0", "-X", "cancel")
+        assert exited_mode.returncode == 0, exited_mode.stderr
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if capture().count(SUBMITTED_MARKER) == 7:
+                break
+            time.sleep(0.25)
+        assert capture().count(SUBMITTED_MARKER) == 7, diagnostics()
+
         # An event that arrives while copy mode owns the pane is deferred. It
         # must not receive input in mode, but should recover after mode exits.
         first_error_id = "2b10afaf-84a8-45ee-8901-c32631c94493"
@@ -238,15 +350,15 @@ def main() -> int:
         entered_mode = tmux("copy-mode", "-t", "0")
         assert entered_mode.returncode == 0, entered_mode.stderr
         time.sleep(2.5)
-        assert capture().count(SUBMITTED_MARKER) == 4, capture()
+        assert capture().count(SUBMITTED_MARKER) == 7, capture()
         exited_mode = tmux("send-keys", "-t", "0", "-X", "cancel")
         assert exited_mode.returncode == 0, exited_mode.stderr
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
-            if capture().count(SUBMITTED_MARKER) == 5:
+            if capture().count(SUBMITTED_MARKER) == 8:
                 break
             time.sleep(0.25)
-        assert capture().count(SUBMITTED_MARKER) == 5, diagnostics()
+        assert capture().count(SUBMITTED_MARKER) == 8, diagnostics()
 
         # Manual recovery during the settle window makes the deferred event
         # stale. The watcher must not submit a duplicate Continue afterward.
@@ -263,12 +375,12 @@ def main() -> int:
         entered_mode = tmux("copy-mode", "-t", "0")
         assert entered_mode.returncode == 0, entered_mode.stderr
         time.sleep(2.5)
-        assert capture().count(SUBMITTED_MARKER) == 5, capture()
+        assert capture().count(SUBMITTED_MARKER) == 8, capture()
         exited_mode = tmux("send-keys", "-t", "0", "-X", "cancel")
         assert exited_mode.returncode == 0, exited_mode.stderr
         send_line("Continue")
         time.sleep(3.0)
-        assert capture().count(SUBMITTED_MARKER) == 6, capture()
+        assert capture().count(SUBMITTED_MARKER) == 9, capture()
 
         restarted = subprocess.run(
             ["python3", str(WATCHER), "--socket", socket, "--restart"],
@@ -287,6 +399,9 @@ def main() -> int:
         assert "event=server_overloaded" in output
         assert "event=cyber_content_blocked" in output
         assert "event=cyber_risk_flagged" in output
+        assert "sent /compact" in output
+        assert "event=context_too_large" in output
+        assert "event=context_compacted" in output
         assert f"deferred error:{first_error_id}" in output
         assert "reason=pane-mode" in output
         assert "event=error" in output

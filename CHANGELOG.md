@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.2.4 - 2026-07-25
+
+- Add guarded two-stage recovery for strict context-size 413 diagnostics:
+  submit `/compact` with a real Enter, then submit `Continue` only after a new
+  column-zero `Context compacted` confirmation from the same pane.
+- Ignore standalone or stale compaction confirmations, suppress duplicate
+  `/compact` submissions, and preserve the existing foreground-process,
+  copy-mode, resize, idle-composer, and live-event revalidation safeguards.
+
 ## v0.2.3 - 2026-07-23
 
 - Migrate complete legacy unmarked curl configuration blocks into the current
