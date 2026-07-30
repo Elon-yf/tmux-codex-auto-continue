@@ -35,12 +35,13 @@ REPLY = "Continue"
 COMPACT_COMMAND = "/compact"
 OPTION_NAME = "@codex-auto-continue"
 EMPTY_COMPOSER_CURSOR_X = 2
-VERSION = "0.2.6"
+VERSION = "0.2.7"
 
 # Requiring Codex's exact event glyph and structure in column zero avoids
 # matching quoted text in user prompts, assistant messages, or shell output.
 ERROR_RE = re.compile(
-    r"^■ An error occurred while processing\b[^\n]*$",
+    r"^■ (?:Error running remote compact task: )?"
+    r"An error occurred while processing\b[^\n]*$",
     re.MULTILINE,
 )
 CAPACITY_RE = re.compile(
@@ -52,7 +53,8 @@ STREAMING_ERROR_RE = re.compile(
     re.MULTILINE,
 )
 SERVER_OVERLOADED_RE = re.compile(
-    r"^■ Our servers are currently overloaded\. Please try again later\."
+    r"^■ (?:Error running remote compact task: )?"
+    r"Our servers are currently overloaded\. Please try again later\."
     r"(?:[ \t]+---)?[ \t]*$",
     re.MULTILINE,
 )
@@ -1537,6 +1539,20 @@ def self_test() -> int:
                 "later.  ---   "
             ),
             (
+                "■ Error running remote compact task: Our servers are "
+                "currently overloaded. Please try again later."
+            ),
+            (
+                "■ Error running remote compact task: An error occurred while "
+                "processing your request. You can retry your request, or "
+                "contact us through our help center at help.openai.com if "
+                "the error persists."
+            ),
+            (
+                "Please include the request ID "
+                "30f0c0fa-d1dc-4c5f-8c63-f2909d6f0fc3 in your message."
+            ),
+            (
                 "› quoted: 1. ─ Worked for 15m 36s ────── 2. ■ An error "
                 "occurred while processing your request. ■ internal streaming "
                 "error, please retry ---"
@@ -1571,6 +1587,8 @@ def self_test() -> int:
         "streaming_error",
         "server_overloaded",
         "server_overloaded",
+        "server_overloaded",
+        "error:30f0c0fa-d1dc-4c5f-8c63-f2909d6f0fc3",
         "capacity",
         "cyber_content_blocked",
         "cyber_risk_flagged",
@@ -1677,6 +1695,31 @@ def self_test() -> int:
         f"  {overloaded}",
     ):
         assert event_signatures(quoted_overloaded) == []
+    remote_overloaded = (
+        "■ Error running remote compact task: Our servers are currently "
+        "overloaded. Please try again later."
+    )
+    assert event_signatures(remote_overloaded) == ["server_overloaded"]
+    assert event_signatures(f"{remote_overloaded}  ---   ") == [
+        "server_overloaded"
+    ]
+    remote_error_id = "30f0c0fa-d1dc-4c5f-8c63-f2909d6f0fc3"
+    remote_error = (
+        "■ Error running remote compact task: An error occurred while "
+        "processing your request. You can retry your request, or contact us "
+        "through our help center at help.openai.com if the error persists.\n"
+        f"Please include the request ID {remote_error_id} in your message."
+    )
+    assert event_signatures(remote_error) == [f"error:{remote_error_id}"]
+    for quoted_remote_event in (
+        remote_overloaded.removeprefix("■ "),
+        f"› {remote_overloaded}",
+        f"  {remote_overloaded}",
+        remote_error.replace("■ ", "", 1),
+        f"› {remote_error}",
+        f"  {remote_error}",
+    ):
+        assert event_signatures(quoted_remote_event) == []
     capacity = "Selected model is at capacity. Please try a different model."
     assert event_signatures(f"⚠ {capacity}") == ["capacity"]
     assert event_signatures(f"⚠ {capacity}\n⚠ {capacity}") == [

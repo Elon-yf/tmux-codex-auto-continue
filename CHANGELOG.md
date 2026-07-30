@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.2.7 - 2026-07-30
+
+- Recognize strict overload and request-failure notices emitted while a remote
+  compaction task is running, and reuse the existing verified `Continue` plus
+  real-Enter submission paths.
+- Keep quoted, indented, incomplete, and modified lookalikes excluded.
+
 ## v0.2.6 - 2026-07-25
 
 - Extend the guarded context-compaction confirmation window from one minute to

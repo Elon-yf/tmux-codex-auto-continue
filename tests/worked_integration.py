@@ -381,6 +381,40 @@ def main() -> int:
         time.sleep(3.0)
         assert capture().count(SUBMITTED_MARKER) == 9, capture()
 
+        # Remote compaction failures use a distinct strict prefix but recover
+        # through the same bracketed-paste plus real-Enter submission path.
+        remote_overloaded = (
+            "■ Error running remote compact task: Our servers are currently "
+            "overloaded. Please try again later."
+        )
+        emit_lines(remote_overloaded)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if capture().count(SUBMITTED_MARKER) == 10:
+                break
+            time.sleep(0.25)
+        assert capture().count(SUBMITTED_MARKER) == 10, diagnostics()
+
+        remote_error_id = "30f0c0fa-d1dc-4c5f-8c63-f2909d6f0fc3"
+        emit_lines(
+            (
+                "■ Error running remote compact task: An error occurred while "
+                "processing your request. You can retry your request, or "
+                "contact us through our help center at help.openai.com if the "
+                "error persists."
+            ),
+            (
+                "Please include the request ID "
+                f"{remote_error_id} in your message."
+            ),
+        )
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if capture().count(SUBMITTED_MARKER) == 11:
+                break
+            time.sleep(0.25)
+        assert capture().count(SUBMITTED_MARKER) == 11, diagnostics()
+
         restarted = subprocess.run(
             ["python3", str(WATCHER), "--socket", socket, "--restart"],
             stdout=subprocess.PIPE,
