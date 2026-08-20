@@ -80,7 +80,7 @@ GOAL_RESUMABLE_STATUSES = frozenset(
     {"active", "paused", "stalled", "blocked", "usage limited"}
 )
 EMPTY_COMPOSER_RE = re.compile(
-    r"^(?:\[[A-Z][A-Z -]*\][ \t]+)?›(?:[ \t]+Ask Codex to do anything)?[ \t]*$",
+    r"^(?:\[[A-Z][A-Z -]*\][ \t]+)?[›»](?:[ \t]+Ask Codex to do anything)?[ \t]*$",
     re.MULTILINE,
 )
 GOAL_FOOTER_ACTIVE_USAGE_RE = (
@@ -279,7 +279,7 @@ def context_too_large_records(text: str) -> list[tuple[int, int, str]]:
     """Return strict, bounded matches for the internal 413 context error."""
 
     matches: list[tuple[int, int, str]] = []
-    event_line_re = re.compile(r"^[■─›•ⓘ⚠](?: |$)")
+    event_line_re = re.compile(r"^[■─›»•ⓘ⚠](?: |$)")
 
     for header in CONTEXT_TOO_LARGE_HEADER_RE.finditer(text):
         block = [header.group(0)]
@@ -320,7 +320,7 @@ def event_records(text: str) -> list[tuple[int, int, str]]:
         tail_lines = text[match.start() :].splitlines()
         block_lines = [tail_lines[0]]
         for line in tail_lines[1:16]:
-            if not line.strip() or re.match(r"^[■─›•] ", line):
+            if not line.strip() or re.match(r"^[■─›»•] ", line):
                 break
             block_lines.append(line)
         request_id = REQUEST_ID_RE.search("\n".join(block_lines))
@@ -375,14 +375,14 @@ def terminal_suffix_is_idle(suffix: str) -> bool:
     """Return whether no later submitted prompt or Codex output is visible."""
 
     if re.search(
-        r"^›[ \t]+(?:Continue|/compact|/goal resume)[ \t]*$",
+        r"^[›»][ \t]+(?:Continue|/compact|/goal resume)[ \t]*$",
         suffix,
         re.MULTILINE,
     ):
         return False
     if re.search(r"^(?:•|■|ⓘ|└|│)[ \t]", suffix, re.MULTILINE):
         return False
-    if len(re.findall(r"^›[ \t].*$", suffix, re.MULTILINE)) > 1:
+    if len(re.findall(r"^[›»][ \t].*$", suffix, re.MULTILINE)) > 1:
         return False
     return True
 
@@ -391,7 +391,7 @@ def composer_has_visible_input(text: str) -> bool:
     """Return whether the bottom composer visibly contains user text."""
 
     lines = text.rstrip("\n").splitlines()
-    return bool(lines and re.match(r"^›[ \t]+\S", lines[-1]))
+    return bool(lines and re.match(r"^[›»][ \t]+\S", lines[-1]))
 
 
 def goal_footer_status_match(text: str, start: int = 0) -> re.Match[str] | None:
@@ -2003,6 +2003,15 @@ def self_test() -> int:
     )
     assert terminal_event_is_current_text(terminal_footer_current, RATE_LIMIT)
     assert goal_resume_reply(terminal_footer_current) is None
+    ultra_footer_current = (
+        f"{rate_limit}\n\n» Ask Codex to do anything\n{footer_stalled}\n"
+    )
+    assert terminal_event_is_current_text(ultra_footer_current, RATE_LIMIT)
+    assert goal_resume_reply(ultra_footer_current) == "/goal resume"
+    ultra_terminal_current = (
+        f"{rate_limit}\n\n» Ask Codex to do anything\n{footer_terminal}\n"
+    )
+    assert goal_resume_reply(ultra_terminal_current) is None
     assert goal_resume_reply(
         f"{footer_active}\n\n{rate_limit}\n\n› "
     ) == REPLY
@@ -2016,6 +2025,11 @@ def self_test() -> int:
     assert not terminal_event_is_current_text(
         f"{rate_limit}\n\n› Ask Codex to do anything\n{footer_stalled}\n"
         "› /goal resume",
+        RATE_LIMIT,
+    )
+    assert not terminal_event_is_current_text(
+        f"{rate_limit}\n\n» Ask Codex to do anything\n{footer_stalled}\n"
+        "» /goal resume",
         RATE_LIMIT,
     )
     assert terminal_event_is_current_text(
