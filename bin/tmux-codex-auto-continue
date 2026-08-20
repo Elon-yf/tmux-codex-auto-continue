@@ -65,10 +65,14 @@ RATE_LIMIT_RE = re.compile(
     r"(?:[ \t]+---)?[ \t]*$",
     re.MULTILINE,
 )
-GOAL_ACTIVE_STATUS_RE = re.compile(
-    r"^• Goal active Objective: \S(?:.*\S)? Time: "
+GOAL_STATUS_RE = re.compile(
+    r"^• Goal (?P<status>active|paused|stalled|blocked|usage limited|"
+    r"budget limited|complete) Objective: \S(?:.*\S)? Time: "
     r"(?:(?:\d+d )?(?:\d+h )?\d+m(?: \d+s)?|\d+s)\.[ \t]*$",
     re.MULTILINE,
+)
+GOAL_RESUMABLE_STATUSES = frozenset(
+    {"active", "paused", "stalled", "blocked", "usage limited"}
 )
 CONTEXT_TOO_LARGE_HEADER_RE = re.compile(
     r"^■ unexpected status 413 Payload Too Large:[ \t]*.*$",
@@ -400,7 +404,7 @@ def terminal_event_is_current_text(
         # A failed goal turn renders this informational status cell after the
         # error. It does not represent a newer turn or user input. Keep the
         # exception strict and scoped only to the 429 recovery path.
-        suffix = GOAL_ACTIVE_STATUS_RE.sub("", suffix)
+        suffix = GOAL_STATUS_RE.sub("", suffix)
     if not terminal_suffix_is_idle(suffix):
         return False
 
@@ -726,6 +730,15 @@ def current_terminal_events(
             context_text=context_text,
         )
     ]
+
+
+def goal_resume_reply(text: str) -> str:
+    """Choose the 429 recovery command from the latest strict Goal status."""
+
+    statuses = [match.group("status") for match in GOAL_STATUS_RE.finditer(text)]
+    if statuses and statuses[-1] in GOAL_RESUMABLE_STATUSES:
+        return "/goal resume"
+    return REPLY
 
 
 def capture_safety_menu_selection(socket: str, pane: str) -> str | None:
@@ -1486,6 +1499,15 @@ def run_daemon(socket: str) -> int:
                 sorted(event.partition(":")[0] for event in state.pending_events)
             )
             reply = state.pending_reply or REPLY
+            # Goal state can change during the bounded 429 backoff. Re-read
+            # the visible terminal immediately before injection so a resume
+            # command is never sent for a stale or newly terminal goal.
+            if RATE_LIMIT in state.pending_events:
+                visible_text = capture_visible_text(socket, pane)
+                if visible_text is None:
+                    clear_pending(state)
+                    continue
+                reply = goal_resume_reply(visible_text)
             pending_deferred = set(state.pending_deferred_events)
             pending_events = set(state.pending_events)
             if submit_text(
@@ -1825,8 +1847,22 @@ def self_test() -> int:
     )
     current_rate_limit = f"{rate_limit}\n\n{goal_active}\n\n› "
     assert terminal_event_is_current_text(current_rate_limit, RATE_LIMIT)
-    assert not terminal_event_is_current_text(
+    assert goal_resume_reply(current_rate_limit) == "/goal resume"
+    for status in ("paused", "stalled", "blocked", "usage limited"):
+        goal = f"• Goal {status} Objective: recover this goal Time: 58m."
+        assert goal_resume_reply(f"{rate_limit}\n\n{goal}\n\n› ") == "/goal resume"
+    for status in ("budget limited", "complete"):
+        goal = f"• Goal {status} Objective: finished goal Time: 58m."
+        current = f"{rate_limit}\n\n{goal}\n\n› "
+        assert terminal_event_is_current_text(current, RATE_LIMIT)
+        assert goal_resume_reply(current) == REPLY
+    assert goal_resume_reply(f"{rate_limit}\n\n› ") == REPLY
+    assert terminal_event_is_current_text(
         current_rate_limit.replace("Goal active", "Goal paused"),
+        RATE_LIMIT,
+    )
+    assert not terminal_event_is_current_text(
+        f"{rate_limit}\n\n• Goal unknown Objective: malformed Time: 58m\n\n› ",
         RATE_LIMIT,
     )
     assert not terminal_event_is_current_text(

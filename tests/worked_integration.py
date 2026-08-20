@@ -15,6 +15,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 WATCHER = ROOT / "bin" / "tmux-codex-auto-continue"
 SUBMITTED_MARKER = "__CONTINUE_SUBMITTED__"
+GOAL_RESUME_MARKER = "__GOAL_RESUME_SUBMITTED__"
 COMPACT_SUBMITTED_MARKER = "__COMPACT_SUBMITTED__"
 
 
@@ -36,7 +37,9 @@ def main() -> int:
         "PS1='› '\n"
         f"Continue() {{ printf '%s\\n' {SUBMITTED_MARKER}; }}\n"
         "trap 'if [[ \"$BASH_COMMAND\" == \"/compact\" ]]; then "
-        f"printf \"%s\\\\n\" {COMPACT_SUBMITTED_MARKER}; fi' DEBUG\n",
+        f"printf \"%s\\\\n\" {COMPACT_SUBMITTED_MARKER}; "
+        f"elif [[ \"$BASH_COMMAND\" == \"/goal resume\" ]]; then "
+        f"printf \"%s\\\\n\" {GOAL_RESUME_MARKER}; fi' DEBUG\n",
         encoding="utf-8",
     )
 
@@ -418,7 +421,8 @@ def main() -> int:
         # A 429 retry-limit marker is recovered with a bounded delay rather
         # than immediately retried in a tight loop. The first retry is one
         # minute later; the unit test covers the backoff sequence and this
-        # integration test verifies that the marker is nevertheless recovered.
+        # integration test verifies that an active Goal uses the literal
+        # `/goal resume` command.
         rate_limit = (
             "■ exceeded retry limit, last status: 429 Too Many Requests"
         )
@@ -430,10 +434,10 @@ def main() -> int:
         assert capture().count(SUBMITTED_MARKER) == 11, diagnostics()
         deadline = time.monotonic() + 65
         while time.monotonic() < deadline:
-            if capture().count(SUBMITTED_MARKER) == 12:
+            if GOAL_RESUME_MARKER in capture():
                 break
             time.sleep(0.25)
-        assert capture().count(SUBMITTED_MARKER) == 12, diagnostics()
+        assert GOAL_RESUME_MARKER in capture(), diagnostics()
 
         restarted = subprocess.run(
             ["python3", str(WATCHER), "--socket", socket, "--restart"],
