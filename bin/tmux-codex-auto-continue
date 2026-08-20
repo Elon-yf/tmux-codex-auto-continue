@@ -65,25 +65,44 @@ RATE_LIMIT_RE = re.compile(
     r"(?:[ \t]+---)?[ \t]*$",
     re.MULTILINE,
 )
+GOAL_DURATION_RE = r"(?:\d+s|\d+m|\d+h(?: \d+m)?|\d+d \d+h \d+m)"
+GOAL_COMPACT_TOKENS_RE = r"\d+(?:\.\d+)?[KMBT]?"
 GOAL_STATUS_RE = re.compile(
     r"^• Goal (?P<status>active|paused|stalled|blocked|usage limited|"
-    r"limited by budget|budget limited|complete) Objective: \S(?:.*\S)? Time: "
-    r"(?:(?:\d+d )?(?:\d+h )?\d+m(?: \d+s)?|\d+s|\d+h)\.[ \t]*$",
+    r"limited by budget|budget limited|complete) Objective: "
+    r"\S(?:.*?\S)?"
+    rf"(?: Time: {GOAL_DURATION_RE}\.)?"
+    rf"(?: Tokens: {GOAL_COMPACT_TOKENS_RE}/{GOAL_COMPACT_TOKENS_RE}\.)?"
+    r"[ \t]*$",
     re.MULTILINE,
 )
 GOAL_RESUMABLE_STATUSES = frozenset(
     {"active", "paused", "stalled", "blocked", "usage limited"}
 )
+EMPTY_COMPOSER_RE = re.compile(
+    r"^(?:\[[A-Z][A-Z -]*\][ \t]+)?›(?:[ \t]+Ask Codex to do anything)?[ \t]*$",
+    re.MULTILINE,
+)
+GOAL_FOOTER_ACTIVE_USAGE_RE = (
+    rf"(?:{GOAL_COMPACT_TOKENS_RE} / {GOAL_COMPACT_TOKENS_RE}|"
+    rf"{GOAL_DURATION_RE})"
+)
+GOAL_FOOTER_UNMET_USAGE_RE = (
+    rf"{GOAL_COMPACT_TOKENS_RE} / {GOAL_COMPACT_TOKENS_RE} tokens"
+)
+GOAL_FOOTER_ACHIEVED_USAGE_RE = (
+    rf"(?:{GOAL_COMPACT_TOKENS_RE} tokens|{GOAL_DURATION_RE})"
+)
 GOAL_FOOTER_STATUS_RE = re.compile(
-    r"^•(?: [^\n]*?•)?[ \t]+(?P<status>"
-    r"Pursuing goal(?: \([^\n()]+\))?|"
+    r"^ {2,}(?:\S(?:[^\n]*?\S)?[ \t]+)?(?P<status>"
+    rf"Pursuing goal(?: \({GOAL_FOOTER_ACTIVE_USAGE_RE}\))?|"
     r"Goal paused \(/goal resume\)|"
     r"Goal stalled \(/goal resume\)|"
     r"Goal hit usage limits \(/goal resume\)|"
-    r"Goal unmet(?: \([^\n()]+\))?|"
+    rf"Goal unmet \({GOAL_FOOTER_UNMET_USAGE_RE}\)|"
     r"Goal abandoned|"
-    r"Goal achieved(?: \([^\n()]+\))?"
-    r")[ \t]*$",
+    rf"Goal achieved(?: \({GOAL_FOOTER_ACHIEVED_USAGE_RE}\))?"
+    r")(?: · IDE context)?[ \t]*$",
     re.MULTILINE,
 )
 CONTEXT_TOO_LARGE_HEADER_RE = re.compile(
@@ -375,6 +394,24 @@ def composer_has_visible_input(text: str) -> bool:
     return bool(lines and re.match(r"^›[ \t]+\S", lines[-1]))
 
 
+def goal_footer_status_match(text: str, start: int = 0) -> re.Match[str] | None:
+    """Return a strict current-footer Goal status after an empty composer."""
+
+    composers = list(EMPTY_COMPOSER_RE.finditer(text, start))
+    if not composers:
+        return None
+    composer = composers[-1]
+    footer_matches = list(GOAL_FOOTER_STATUS_RE.finditer(text, composer.end()))
+    if not footer_matches:
+        return None
+    footer = footer_matches[-1]
+    if text[composer.end() : footer.start()].strip():
+        return None
+    if text[footer.end() :].strip():
+        return None
+    return footer
+
+
 def terminal_event_is_current_text(
     text: str,
     event: str,
@@ -423,7 +460,9 @@ def terminal_event_is_current_text(
         # error. It does not represent a newer turn or user input. Keep the
         # exception strict and scoped only to the 429 recovery path.
         suffix = GOAL_STATUS_RE.sub("", suffix)
-        suffix = GOAL_FOOTER_STATUS_RE.sub("", suffix)
+        footer = goal_footer_status_match(suffix)
+        if footer is not None:
+            suffix = suffix[: footer.start()] + suffix[footer.end() :]
     if not terminal_suffix_is_idle(suffix):
         return False
 
@@ -766,20 +805,21 @@ def goal_resume_reply(text: str) -> str | None:
         (match.start(), match.group("status") in GOAL_RESUMABLE_STATUSES)
         for match in GOAL_STATUS_RE.finditer(text, start)
     )
-    statuses.extend(
-        (
-            match.start(),
-            match.group("status").startswith(
-                (
-                    "Pursuing goal",
-                    "Goal paused",
-                    "Goal stalled",
-                    "Goal hit usage limits",
-                )
-            ),
+    footer = goal_footer_status_match(text, start)
+    if footer is not None:
+        statuses.append(
+            (
+                footer.start(),
+                footer.group("status").startswith(
+                    (
+                        "Pursuing goal",
+                        "Goal paused",
+                        "Goal stalled",
+                        "Goal hit usage limits",
+                    )
+                ),
+            )
         )
-        for match in GOAL_FOOTER_STATUS_RE.finditer(text, start)
-    )
     if not statuses:
         return REPLY
     if sorted(statuses)[-1][1]:
@@ -1925,24 +1965,41 @@ def self_test() -> int:
     assert goal_resume_reply(
         f"{rate_limit}\n\n• Goal active Objective: hourly goal Time: 2h.\n\n› "
     ) == "/goal resume"
-    footer_active = "• model gpt-5.6 • Pursuing goal (fix retry)"
-    footer_stalled = "• Goal stalled (/goal resume)"
-    footer_terminal = "• Goal achieved (all work complete)"
-    for footer in (footer_active, footer_stalled):
-        current = f"{rate_limit}\n\n{footer}\n\n› "
+    for status in (
+        "• Goal active Objective: zero-time goal",
+        "• Goal active Objective: token goal Tokens: 63.9K/50K.",
+        "• Goal active Objective: day goal Time: 1d 2h 3m.",
+        "• Goal active Objective: tracked goal Time: 2h 3m. Tokens: 40K/50K.",
+    ):
+        current = f"{rate_limit}\n\n{status}\n\n› "
         assert terminal_event_is_current_text(current, RATE_LIMIT)
         assert goal_resume_reply(current) == "/goal resume"
-    terminal_footer_current = f"{rate_limit}\n\n{footer_terminal}\n\n› "
+    footer_active = "  gpt-5.4                  Pursuing goal (40K / 50K)"
+    footer_stalled = "  gpt-5.6-sol default      Goal stalled (/goal resume) · IDE context"
+    footer_terminal = "  Goal achieved"
+    for footer in (footer_active, footer_stalled):
+        current = f"{rate_limit}\n\n› Ask Codex to do anything\n{footer}\n"
+        assert terminal_event_is_current_text(current, RATE_LIMIT)
+        assert goal_resume_reply(current) == "/goal resume"
+    terminal_footer_current = (
+        f"{rate_limit}\n\n[NORMAL] › Ask Codex to do anything\n"
+        f"{footer_terminal}\n"
+    )
     assert terminal_event_is_current_text(terminal_footer_current, RATE_LIMIT)
     assert goal_resume_reply(terminal_footer_current) is None
     assert goal_resume_reply(
         f"{footer_active}\n\n{rate_limit}\n\n› "
     ) == REPLY
     assert goal_resume_reply(
-        f"{rate_limit}\n\nPursuing goal (quoted text)\n\n› "
+        f"{rate_limit}\n\n› Ask Codex to do anything\n"
+        "Goal stalled (/goal resume)\n"
+    ) == REPLY
+    assert goal_resume_reply(
+        f"{rate_limit}\n\n{footer_stalled}\n\n› Ask Codex to do anything"
     ) == REPLY
     assert not terminal_event_is_current_text(
-        f"{rate_limit}\n\n{footer_stalled}\n\n› /goal resume",
+        f"{rate_limit}\n\n› Ask Codex to do anything\n{footer_stalled}\n"
+        "› /goal resume",
         RATE_LIMIT,
     )
     assert terminal_event_is_current_text(

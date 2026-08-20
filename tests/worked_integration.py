@@ -432,6 +432,7 @@ def main() -> int:
         )
         time.sleep(3.0)
         assert capture().count(SUBMITTED_MARKER) == 11, diagnostics()
+        assert capture().count(GOAL_RESUME_MARKER) == 0, diagnostics()
         deadline = time.monotonic() + 65
         while time.monotonic() < deadline:
             if GOAL_RESUME_MARKER in capture():
