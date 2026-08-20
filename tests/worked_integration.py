@@ -437,7 +437,8 @@ def main() -> int:
             if GOAL_RESUME_MARKER in capture():
                 break
             time.sleep(0.25)
-        assert GOAL_RESUME_MARKER in capture(), diagnostics()
+        assert capture().count(GOAL_RESUME_MARKER) == 1, diagnostics()
+        assert capture().count(SUBMITTED_MARKER) == 11, diagnostics()
 
         restarted = subprocess.run(
             ["python3", str(WATCHER), "--socket", socket, "--restart"],

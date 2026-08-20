@@ -67,12 +67,24 @@ RATE_LIMIT_RE = re.compile(
 )
 GOAL_STATUS_RE = re.compile(
     r"^• Goal (?P<status>active|paused|stalled|blocked|usage limited|"
-    r"budget limited|complete) Objective: \S(?:.*\S)? Time: "
-    r"(?:(?:\d+d )?(?:\d+h )?\d+m(?: \d+s)?|\d+s)\.[ \t]*$",
+    r"limited by budget|budget limited|complete) Objective: \S(?:.*\S)? Time: "
+    r"(?:(?:\d+d )?(?:\d+h )?\d+m(?: \d+s)?|\d+s|\d+h)\.[ \t]*$",
     re.MULTILINE,
 )
 GOAL_RESUMABLE_STATUSES = frozenset(
     {"active", "paused", "stalled", "blocked", "usage limited"}
+)
+GOAL_FOOTER_STATUS_RE = re.compile(
+    r"^•(?: [^\n]*?•)?[ \t]+(?P<status>"
+    r"Pursuing goal(?: \([^\n()]+\))?|"
+    r"Goal paused \(/goal resume\)|"
+    r"Goal stalled \(/goal resume\)|"
+    r"Goal hit usage limits \(/goal resume\)|"
+    r"Goal unmet(?: \([^\n()]+\))?|"
+    r"Goal abandoned|"
+    r"Goal achieved(?: \([^\n()]+\))?"
+    r")[ \t]*$",
+    re.MULTILINE,
 )
 CONTEXT_TOO_LARGE_HEADER_RE = re.compile(
     r"^■ unexpected status 413 Payload Too Large:[ \t]*.*$",
@@ -178,6 +190,12 @@ class PaneState:
     last_menu_attempt: float = 0.0
     safety_menu_latched: bool = False
     safety_menu_absent_polls: int = 0
+
+
+@dataclass(frozen=True)
+class SubmitResult:
+    reply: str | None = None
+    preserve_pending: bool = False
 
 
 def run_tmux(socket: str, *args: str) -> subprocess.CompletedProcess[str]:
@@ -338,7 +356,7 @@ def terminal_suffix_is_idle(suffix: str) -> bool:
     """Return whether no later submitted prompt or Codex output is visible."""
 
     if re.search(
-        r"^›[ \t]+(?:Continue|/compact)[ \t]*$",
+        r"^›[ \t]+(?:Continue|/compact|/goal resume)[ \t]*$",
         suffix,
         re.MULTILINE,
     ):
@@ -405,6 +423,7 @@ def terminal_event_is_current_text(
         # error. It does not represent a newer turn or user input. Keep the
         # exception strict and scoped only to the 429 recovery path.
         suffix = GOAL_STATUS_RE.sub("", suffix)
+        suffix = GOAL_FOOTER_STATUS_RE.sub("", suffix)
     if not terminal_suffix_is_idle(suffix):
         return False
 
@@ -714,13 +733,13 @@ def capture_visible_text(socket: str, pane: str) -> str | None:
 
 def current_terminal_events(
     socket: str, pane: str, events: list[str] | set[str]
-) -> list[str]:
+) -> list[str] | None:
     text = capture_visible_text(socket, pane)
     if text is None:
-        return []
+        return None
     context_text = capture_event_text(socket, pane)
     if context_text is None:
-        return []
+        return None
     return [
         event
         for event in events
@@ -732,13 +751,40 @@ def current_terminal_events(
     ]
 
 
-def goal_resume_reply(text: str) -> str:
-    """Choose the 429 recovery command from the latest strict Goal status."""
+def goal_resume_reply(text: str) -> str | None:
+    """Choose the 429 command from the current event's strict Goal trailer.
 
-    statuses = [match.group("status") for match in GOAL_STATUS_RE.finditer(text)]
-    if statuses and statuses[-1] in GOAL_RESUMABLE_STATUSES:
+    ``None`` means the current Goal is terminal and must not be retried.
+    """
+
+    rate_limits = list(RATE_LIMIT_RE.finditer(text))
+    if not rate_limits:
+        return REPLY
+    start = rate_limits[-1].end()
+    statuses: list[tuple[int, bool]] = []
+    statuses.extend(
+        (match.start(), match.group("status") in GOAL_RESUMABLE_STATUSES)
+        for match in GOAL_STATUS_RE.finditer(text, start)
+    )
+    statuses.extend(
+        (
+            match.start(),
+            match.group("status").startswith(
+                (
+                    "Pursuing goal",
+                    "Goal paused",
+                    "Goal stalled",
+                    "Goal hit usage limits",
+                )
+            ),
+        )
+        for match in GOAL_FOOTER_STATUS_RE.finditer(text, start)
+    )
+    if not statuses:
+        return REPLY
+    if sorted(statuses)[-1][1]:
         return "/goal resume"
-    return REPLY
+    return None
 
 
 def capture_safety_menu_selection(socket: str, pane: str) -> str | None:
@@ -905,7 +951,7 @@ def submit_text(
     process_identity: str,
     expected_events: set[str],
     reply: str,
-) -> bool:
+) -> SubmitResult:
     """Paste text explicitly, then submit it with a real Enter key.
 
     Codex treats a rapid sequence of ordinary character key events as a paste
@@ -917,26 +963,26 @@ def submit_text(
 
     if pane_cursor_x(socket, pane) != EMPTY_COMPOSER_CURSOR_X:
         log(f"skipped pane {pane}: composer is not empty or not ready")
-        return False
+        return SubmitResult()
 
     buffer_name = f"codex-auto-continue-{os.getpid()}-{pane.lstrip('%')}"
     if codex_process_identity(pane_pid) != process_identity:
         log(f"skipped pane {pane}: Codex foreground process changed")
-        return False
+        return SubmitResult()
     if pane_is_in_mode(socket, pane) or not option_enabled(socket):
         log(f"skipped pane {pane}: pane mode or option changed")
-        return False
+        return SubmitResult()
     visible_text = capture_visible_text(socket, pane)
     if visible_text is None:
         log(f"skipped pane {pane}: pane viewport is unavailable")
-        return False
+        return SubmitResult(preserve_pending=True)
     if safety_menu_selection(visible_text) is not None:
         log(f"skipped pane {pane}: safety menu owns the keyboard")
-        return False
+        return SubmitResult()
     context_text = capture_event_text(socket, pane)
     if context_text is None:
         log(f"skipped pane {pane}: pane history is unavailable")
-        return False
+        return SubmitResult(preserve_pending=True)
     if not any(
         terminal_event_is_current_text(
             visible_text,
@@ -946,7 +992,13 @@ def submit_text(
         for event in expected_events
     ):
         log(f"skipped pane {pane}: terminal event is no longer current")
-        return False
+        return SubmitResult()
+
+    if RATE_LIMIT in expected_events:
+        reply = goal_resume_reply(visible_text)
+        if reply is None:
+            log(f"skipped pane {pane}: Goal is terminal")
+            return SubmitResult()
 
     submitted = run_tmux(
         socket,
@@ -971,8 +1023,8 @@ def submit_text(
     )
     if submitted.returncode != 0:
         log(f"failed to submit reply to pane {pane}: {submitted.stderr.strip()}")
-        return False
-    return True
+        return SubmitResult()
+    return SubmitResult(reply=reply)
 
 
 def choose_keep_waiting(
@@ -1434,6 +1486,12 @@ def run_daemon(socket: str) -> int:
                 pane,
                 state.pending_events,
             )
+            if current_events is None:
+                log(
+                    f"preserved pending recovery for pane {pane} "
+                    f"({session}); terminal capture is unavailable"
+                )
+                continue
             if not current_events:
                 if (
                     state.awaiting_context_compacted
@@ -1486,7 +1544,11 @@ def run_daemon(socket: str) -> int:
                     )
                     defer_events(
                         state,
-                        current_events,
+                        (
+                            current_events
+                            if current_events is not None
+                            else list(state.pending_events)
+                        ),
                         now,
                         pane,
                         session,
@@ -1499,27 +1561,19 @@ def run_daemon(socket: str) -> int:
                 sorted(event.partition(":")[0] for event in state.pending_events)
             )
             reply = state.pending_reply or REPLY
-            # Goal state can change during the bounded 429 backoff. Re-read
-            # the visible terminal immediately before injection so a resume
-            # command is never sent for a stale or newly terminal goal.
-            if RATE_LIMIT in state.pending_events:
-                visible_text = capture_visible_text(socket, pane)
-                if visible_text is None:
-                    clear_pending(state)
-                    continue
-                reply = goal_resume_reply(visible_text)
             pending_deferred = set(state.pending_deferred_events)
             pending_events = set(state.pending_events)
-            if submit_text(
+            result = submit_text(
                 socket,
                 pane,
                 pane_pid,
                 process_identity,
                 state.pending_events,
                 reply,
-            ):
+            )
+            if result.reply is not None:
                 state.last_sent = time.monotonic()
-                if reply == COMPACT_COMMAND:
+                if result.reply == COMPACT_COMMAND:
                     clear_compaction_wait(state)
                     state.awaiting_context_compacted = True
                     state.context_compaction_started = state.last_sent
@@ -1529,7 +1583,7 @@ def run_daemon(socket: str) -> int:
                     )
                 else:
                     log(
-                        f"sent Continue to pane {pane} ({session}); "
+                        f"sent {result.reply} to pane {pane} ({session}); "
                         f"event={kinds}"
                     )
                     if (
@@ -1542,6 +1596,8 @@ def run_daemon(socket: str) -> int:
                         clear_compaction_wait(state)
                 if pending_deferred:
                     state.deferred_events.clear()
+            elif result.preserve_pending:
+                continue
             clear_pending(state)
 
         for pane in set(states) - seen_panes:
@@ -1851,12 +1907,44 @@ def self_test() -> int:
     for status in ("paused", "stalled", "blocked", "usage limited"):
         goal = f"• Goal {status} Objective: recover this goal Time: 58m."
         assert goal_resume_reply(f"{rate_limit}\n\n{goal}\n\n› ") == "/goal resume"
-    for status in ("budget limited", "complete"):
+    for status in ("limited by budget", "budget limited", "complete"):
         goal = f"• Goal {status} Objective: finished goal Time: 58m."
         current = f"{rate_limit}\n\n{goal}\n\n› "
         assert terminal_event_is_current_text(current, RATE_LIMIT)
-        assert goal_resume_reply(current) == REPLY
+        assert goal_resume_reply(current) is None
     assert goal_resume_reply(f"{rate_limit}\n\n› ") == REPLY
+    assert goal_resume_reply(f"{goal_active}\n\n{rate_limit}\n\n› ") == REPLY
+    assert goal_resume_reply(
+        f"{rate_limit}\n\n{goal_active}\n\n"
+        f"{rate_limit}\n\n› "
+    ) == REPLY
+    assert goal_resume_reply(
+        f"{rate_limit}\n\n• Goal complete Objective: old goal Time: 58m.\n\n"
+        f"{rate_limit}\n\n{goal_active}\n\n› "
+    ) == "/goal resume"
+    assert goal_resume_reply(
+        f"{rate_limit}\n\n• Goal active Objective: hourly goal Time: 2h.\n\n› "
+    ) == "/goal resume"
+    footer_active = "• model gpt-5.6 • Pursuing goal (fix retry)"
+    footer_stalled = "• Goal stalled (/goal resume)"
+    footer_terminal = "• Goal achieved (all work complete)"
+    for footer in (footer_active, footer_stalled):
+        current = f"{rate_limit}\n\n{footer}\n\n› "
+        assert terminal_event_is_current_text(current, RATE_LIMIT)
+        assert goal_resume_reply(current) == "/goal resume"
+    terminal_footer_current = f"{rate_limit}\n\n{footer_terminal}\n\n› "
+    assert terminal_event_is_current_text(terminal_footer_current, RATE_LIMIT)
+    assert goal_resume_reply(terminal_footer_current) is None
+    assert goal_resume_reply(
+        f"{footer_active}\n\n{rate_limit}\n\n› "
+    ) == REPLY
+    assert goal_resume_reply(
+        f"{rate_limit}\n\nPursuing goal (quoted text)\n\n› "
+    ) == REPLY
+    assert not terminal_event_is_current_text(
+        f"{rate_limit}\n\n{footer_stalled}\n\n› /goal resume",
+        RATE_LIMIT,
+    )
     assert terminal_event_is_current_text(
         current_rate_limit.replace("Goal active", "Goal paused"),
         RATE_LIMIT,
