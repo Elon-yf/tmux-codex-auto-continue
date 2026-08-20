@@ -1,189 +1,646 @@
-# Codex `429 Too Many Requests` 自动恢复设计
+# tmux-codex-auto-continue：429 与 Goal 恢复的原理和实现
 
-## 1. 问题是什么
+这份文档从操作系统的最底层开始解释这个插件。假设读者此前不知道
+`tmux`、`pane`、PTY、TUI 或 Codex Goal 是什么，也可以顺着读下来。
 
-截图里的终端状态是：
+本文针对的现象是终端里出现类似下面的内容：
 
 ```text
 ■ exceeded retry limit, last status: 429 Too Many Requests
+• Goal active Objective: 现在做的就是goal Time: 58m.
+```
+
+本次修复的行为规则是：
+
+| 当前终端状态 | 429 退避结束后发送的输入 |
+| --- | --- |
+| 429 仍是当前错误，并且有可恢复的 Goal 状态（active、paused、stalled/blocked、usage limited） | `/goal resume` |
+| 429 仍是当前错误，但没有可恢复的 Goal | `Continue` |
+| Goal 已 complete 或 limited by budget | 不自动把它重新启动 |
+
+这里的“发送”不是调用一个隐藏 API，而是像用户一样向**同一个已经运行的
+Codex CLI 终端**粘贴一行文字，再按一次 Enter。官方 CLI 文档明确列出了
+`/goal pause`、`/goal resume` 和 `/goal clear`；桌面应用的按钮说明不能替代
+终端 TUI 的命令。参见 [Codex CLI developer commands](https://developers.openai.com/codex/cli/slash-commands)
+和 [Follow a goal](https://developers.openai.com/codex/use-cases/follow-goals)。
+
+---
+
+## 1. 先建立整体地图：这个插件位于哪里
+
+从用户按键到 Codex 收到输入，中间有多个层。把这些层混在一起，就很容易
+误以为插件在“控制 OpenAI 服务”或“直接修改 Goal 数据库”；实际上它做的事
+要窄得多。
+
+```text
+┌──────────────────────────────────────────────────────────────┐
+│ Linux 主机                                                    │
+│                                                              │
+│  终端模拟器（kitty、gnome-terminal、DingTalk 内嵌终端等）      │
+│       │ 键盘字符 / 控制序列                                   │
+│       ▼                                                      │
+│  tmux client ───────► tmux server                             │
+│                              │                                │
+│                              ▼                                │
+│                    session / window / pane                   │
+│                              │                                │
+│                         pane 的 PTY                           │
+│                              │                                │
+│                    shell + Codex CLI TUI                     │
+│                              │                                │
+│                         HTTPS 请求                            │
+│                              ▼                                │
+│                       Codex 服务端                            │
+└──────────────────────────────────────────────────────────────┘
+
+tmux-codex-auto-continue（另一个本地 Python 进程）
+        │
+        ├─ tmux list-panes / /proc：确认目标真的是 Codex
+        ├─ tmux capture-pane：读取 pane 上已经渲染的文字
+        ├─ 本地正则和状态机：判断是否出现可恢复事件
+        └─ tmux set-buffer + paste-buffer + send-keys Enter：注入输入
+```
+
+每一层的职责如下：
+
+| 层 | 它是什么 | 它在本问题中做什么 |
+| --- | --- | --- |
+| Linux 内核 | 管理进程、进程组、伪终端、文件描述符和调度 | 让 shell、Codex 和 tmux 有真实的进程与输入输出通道 |
+| 终端模拟器 | 把字节流显示成窗口，把键盘转换成终端输入 | 画出你看到的字符；它通常不知道 Goal 的语义 |
+| tmux server | 后台保存终端会话和窗口布局 | 即使终端窗口关闭，session/pane 仍可继续运行 |
+| pane | tmux 中一个分割出来的终端区域及其 PTY | Codex CLI 实际运行、显示文字、接收输入的地方 |
+| Codex CLI/TUI | 交互式终端程序 | 调用模型服务、维护会话/Goal 状态、渲染错误和状态行 |
+| watcher | 本插件启动的本地守护进程 | 观察已存在的 pane，并在严格条件满足时模拟用户输入 |
+| Codex 服务端 | 接收请求并返回模型结果的远端服务 | 可能返回 HTTP 429；watcher 不直接接触这一层 |
+
+因此，这个项目不是一个 API 客户端，也不是一个任务调度器。它是一个
+**基于 tmux 终端画面的本地输入恢复器**。
+
+## 2. Linux 基础：进程、PTY 和前台进程组
+
+### 2.1 终端不是“一个字符串窗口”
+
+Linux 终端程序通过一个伪终端（PTY，pseudo-terminal）通信。PTY 有两端：
+
+```text
+程序端（slave）                         控制端（master）
+shell / Codex  ──写输出──►  tmux / 终端模拟器
+shell / Codex  ◄─读输入──  tmux / 终端模拟器
+```
+
+Codex 打印的字符先进入 PTY，再由 tmux 维护屏幕网格，最后由终端模拟器显示。
+插件并不从 Codex 的网络连接里读 JSON，也不从模型服务拿状态；它读取 tmux
+保存的屏幕网格和有限滚动历史。因此插件看到的是“用户能看到的 UI 证据”，而
+不是 Codex 内部 Rust 对象的直接引用。
+
+### 2.2 为什么要看前台进程组
+
+一个 pane 的 `pane_pid` 往往是 shell，而不是 Codex 本身。用户在 shell 里
+启动 `codex` 后，shell 会把 Codex 放进一个前台进程组；输入按键会送给这个
+前台组。只检查命令行里是否出现字符串 `codex` 不够安全，因为：
+
+- shell 可能恰好有一个名为 codex 的参数；
+- Codex 已退出，但旧文字仍留在滚动历史里；
+- pane 可能在 watcher 检查期间切换回 shell；
+- 同一台机器上可能同时有多个 agent 和多个 pane。
+
+Linux `/proc/<pid>/stat` 提供进程组和控制终端前台进程组信息。watcher 的
+身份检查大致是：
+
+```text
+pane_pid
+  └─读取前台 PGID（foreground process group）
+      └─遍历该组的进程树
+          └─找到 npm @openai/codex/.../vendor/.../codex native binary
+```
+
+只有这条链条成立，插件才认为“这个 pane 当前由 Codex 拥有键盘”。如果
+Codex 退出、进程组改变或 `/proc` 信息不一致，插件会放弃发送。相关 Linux
+概念可参阅 [`proc_pid_stat(5)`](https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html)。
+
+### 2.3 什么是 TUI
+
+TUI（terminal user interface）是运行在字符终端里的交互界面。Codex TUI
+通过 ANSI 控制序列移动光标、画分隔线、显示 `›` 输入提示和 `•` 状态行。
+屏幕上看到的行不一定是一条“模型消息”：
+
+- `■ ...` 通常是错误/诊断信息；
+- `• Goal ...` 是 Goal 状态信息；
+- `• Ran ...`、`• Edited ...` 是活动记录；
+- `› ...` 是 composer（输入框）里的用户输入；
+- `─ Worked for ... ─` 是一次 turn 的耗时边界。
+
+所以 watcher 必须按**行的前缀、列位置和上下文**识别，而不能搜索一个
+孤立的关键词 `429` 或 `goal`。
+
+## 3. tmux 基础：session、window、pane 到底是什么
+
+### 3.1 三个层级
+
+```text
+tmux server（一个后台 tmux 实例，通常由 socket 标识）
+└── session（例如 work）
+    └── window（例如 0:codex）
+        ├── pane %1（左侧 shell）
+        └── pane %2（右侧 Codex CLI）
+```
+
+- **server**：后台进程，持有所有 session 和 pane。不同 `tmux -L name`
+  可以有不同 server/socket。
+- **session**：一组可脱离、可重新连接的工作环境。
+- **window**：session 中的一个标签页。
+- **pane**：window 内的一个终端分割区域。`%2` 是 pane 的 ID，不是屏幕
+  坐标；它对应一个真实 PTY 和一个进程树。
+
+“pane”可以类比成一个持续存在的远程终端插座：终端窗口只是插在这个插座
+上的显示器，tmux server 和 pane 可以在显示器关闭后继续存在。
+
+### 3.2 如何亲眼查看 pane
+
+```sh
+# 列出所有 pane、PID、尺寸和 mode
+tmux list-panes -a -F \
+  '#{pane_id} pid=#{pane_pid} mode=#{pane_in_mode} size=#{pane_width}x#{pane_height}'
+
+# 把 pane 当前可见网格打印到 stdout；-J 合并视觉换行
+tmux capture-pane -p -J -t %2
+
+# 查看某个 pane 的前台进程（这里只是辅助观察）
+ps -o pid,pgid,tpgid,stat,cmd -p "$(tmux display-message -p -t %2 '#{pane_pid}')"
+```
+
+插件使用的是同一组 tmux 能力，但通过 `tmux -S <socket>` 明确指定 server，
+避免把输入发到另一个 socket 的 pane。
+
+### 3.3 pane mode 为什么重要
+
+当用户按下 prefix+`[` 进入 copy-mode，或打开 tmux 的其他选择界面时，键盘
+不再属于 Codex composer。此时自动发送 `/goal resume` 或 Enter 可能只是滚动
+屏幕、选择菜单项，甚至破坏用户操作。
+
+因此 `pane_in_mode != 0` 被视为“键盘被占用”，事件可以暂存，但绝不发送。
+退出 mode 后，插件还要重新确认同一个事件仍在当前画面中；如果用户已经
+输入了内容或 Codex 已经产生新输出，就丢弃旧事件。
+
+## 4. Codex Goal 和普通 Continue 的区别
+
+### 4.1 普通 turn
+
+普通 Codex 交互大致是：
+
+```text
+用户输入 ─► Codex CLI ─► 模型/工具循环 ─► 最终回答或错误
+             ▲                              │
+             └──────── Continue ────────────┘
+```
+
+`Continue` 是一条普通的用户输入。它要求当前线程再开始一个 turn，但它
+本身不改变 Goal 的持久状态。
+
+### 4.2 Goal turn
+
+`/goal <objective>` 会把一个持久目标附加到当前**已保存的 thread/session**。
+Goal 有自己的生命周期和使用量，例如：
+
+```text
+             /goal <objective>
+                    │
+                    ▼
+      active ──► paused ──► active
+         │          │
+         ├──────► stalled/blocked
+         ├──────► usage limited
+         ├──────► limited by budget
+         └──────► complete
+```
+
+官方 CLI 的 TUI 会在两个位置表达 Goal 状态。第一处是 turn 记录区里的信息
+cell，也就是截图中以 `•` 开头的行：
+
+```text
 • Goal active Objective: ... Time: 58m.
+• Goal paused Objective: ... Time: 58m.
+• Goal stalled Objective: ... Time: 58m.
+• Goal usage limited Objective: ... Time: 58m.
 ```
 
-这里有两个不同层次的状态：
+其中 `stalled` 是用户可见的 blocked 状态标签。Goal 状态行是 TUI 的信息
+cell，不是一次新的 assistant/tool turn；这正是截图中 429 后面那一行不能
+被当成“已经有新输出”的原因。
 
-1. `429 Too Many Requests` 是本次 Codex 请求已经连续失败后的终止错误。
-2. `Goal active` 表示当前 goal/session 仍然存在，并不等于本次请求已经成功，也不等于 Codex 会自动重新发起请求。
-
-因此，恢复目标不是创建一个新 session，也不是伪造 goal 状态，而是在同一个已验证的 Codex tmux pane 中，等待限流窗口后提交一次 `Continue`，让 Codex 自己决定如何继续当前 goal。
-
-## 2. 原 watcher 的原理
-
-`tmux-codex-auto-continue` 是一个本地 watcher，核心循环如下：
+第二处是输入框附近、通常靠右显示的 footer。终端宽度和当前布局会改变它的
+横向位置，但 Codex 0.147.0 的状态文案是：
 
 ```text
-列出 tmux panes
-  ↓
-确认 pane 前台进程组确实包含 npm @openai/codex 的 native binary
-  ↓
-capture-pane 读取当前 viewport 和有限历史
-  ↓
-严格匹配 Codex 的错误/中断/安全菜单文本
-  ↓
-等待短暂 settle window，重新确认事件仍在当前 pane
-  ↓
-确认 pane 非 copy-mode、composer 为空、watcher 仍启用
-  ↓
-使用 tmux bracketed paste 写入 Continue，再发送真实 Enter
+Pursuing goal (58m)                    # active
+Goal paused (/goal resume)             # paused
+Goal stalled (/goal resume)            # blocked/stalled
+Goal hit usage limits (/goal resume)   # usage limited
+Goal unmet (50K / 50K)                 # limited by budget
+Goal abandoned                         # limited by budget、无用量文本
+Goal achieved (58m)                    # complete
 ```
 
-它只向已有 pane 注入输入，不创建、重命名、重启、关闭或杀死 tmux session/pane。输入注入前会再次检查进程身份、pane 模式、当前错误文本和 composer，避免把按键发给 shell、旧 pane 或用户正在输入的内容。
+因此你看到右下角的 `Goal stalled (/goal resume)` 不是按钮，也不是终端模拟器
+添加的提示；它是 **Codex TUI 自己给出的 slash-command 操作提示**。tmux 的
+`capture-pane` 读取的是整张字符网格，所以 watcher 能看到该 footer，之后仍然
+只能通过向 pane 的 PTY 输入字面量 `/goal resume` 来执行它。
 
-原实现已经支持普通 processing error、streaming error、server overloaded、model capacity、部分安全提示和高置信度的中断 `Worked for` 状态。但它依赖“支持的列 0 文本事件 + Continue”，并没有把截图中的 429 文案归类为事件，所以该错误不会进入恢复队列。
+### 4.3 为什么 Goal 要用 `/goal resume`
 
-## 3. 为什么只加一条正则还不够
+当 Goal 处于 paused、stalled/blocked 或 usage-limited 等需要恢复的状态时，
+普通 `Continue` 只是追加一条普通消息；`/goal resume` 才是 Codex CLI 提供的
+Goal 状态操作。
 
-单纯加入：
+截图中的 `Goal active` 需要单独解释：这里“active”描述的是 Goal 元数据仍然
+处于活动态，不等于刚才那次模型请求仍在执行。前一行已经说明请求重试耗尽，
+所以执行循环事实上停在 429 上。这个 watcher 采用明确的恢复策略：
 
-```python
-r"^■ exceeded retry limit, last status: 429 Too Many Requests$"
+```text
+429 已终止当前执行 + 当前仍有 active Goal
+        │
+        └─► 输入 /goal resume，重新从 Goal 控制入口触发
 ```
 
-仍有三个问题：
+也就是说，`active + 429 -> /goal resume` 是本插件对这个组合状态的恢复规则；
+它不是把 `active` 误说成 `paused`。这样既遵守你的输入要求，也保留了两种
+状态各自真正表达的含义。
 
-### 3.1 会把限流变成请求风暴
+注意：这里说的是**终端 CLI 命令**。桌面应用有进度条按钮，但本插件的目标
+是 Linux tmux 中的 Codex TUI，输入只能通过终端注入，所以实现使用字面量
+`/goal resume`，不依赖任何桌面按钮。
 
-普通错误可以在短 settle window 后重试；429 的原因恰恰是服务端拒绝了过多/过快请求。如果每轮 poll 都重新发送 `Continue`，就会继续撞上同一限流窗口。
+### 4.4 为什么不能看到 `goal` 这个单词就发送 resume
 
-### 3.2 同一个错误需要事件身份和去重
+目标文本本身可能是“修复 goal parser”，普通回答也可能提到 goal。可靠的
+判定必须同时满足：
 
-watcher 每 0.5 秒读取滚动终端历史。相同文本持续留在 pane 中时，不能把它当成无限个新事件；只有同一错误再次被 Codex 重新渲染，才应视为下一次恢复尝试。
+1. 行首是 Codex 的状态前缀 `•`，而不是用户输入或引用内容；
+2. 状态词是可恢复 Goal 状态，而不是任意出现的字符串；
+3. 同一个当前 pane 中存在仍有效的 429 事件；
+4. composer 为空，没有用户正在输入；
+5. pane 仍由同一个 Codex 前台进程组拥有。
 
-### 3.3 截图中的 `Goal active` 不是新一轮输出
+完成状态和 limited-by-budget 状态不会触发 `/goal resume`，避免把已经结束或
+达到硬预算的工作偷偷重新启动。
 
-原来的 stale-event 检查会把错误后面的 `• ...` 行视为后续 Codex 输出，从而拒绝恢复。截图中的 `Goal active Objective ... Time ...` 是状态 cell，不是新的 assistant/tool turn；但其他后续输出仍然必须取消旧恢复。因此它必须是一个严格、仅对 429 生效的例外，而不能放宽全局终端校验。
+## 5. 429 到底发生了什么
 
-## 4. 当前实现如何解决
-
-### 4.1 严格事件识别
-
-新增 `RATE_LIMIT` 事件，只匹配完整列 0 文本：
+HTTP 429（Too Many Requests）表示服务端暂时拒绝请求，常见原因包括账户/模型
+使用额度、速率窗口或服务侧保护。Codex CLI 通常会在客户端进行有限次重试；
+当这些重试也失败时，TUI 渲染：
 
 ```text
 ■ exceeded retry limit, last status: 429 Too Many Requests
 ```
 
-允许 Codex 显示的末尾 `---` 和空格；以下内容均不会匹配：
+这句话不是“插件已经重试了很多次”，而是 Codex 自己的请求循环已经达到
+重试上限。此时立即再按一次输入，通常只会再次撞同一个限流窗口，形成：
 
-- 去掉 `■` 的文本；
-- 带 `›`、`•` 或缩进的引用文本；
-- 改成 500 或其他 HTTP 状态；
-- 改写 `Too Many Requests` 的文案；
-- 不完整的错误头。
+```text
+429 ─► Continue ─► 429 ─► Continue ─► 429 ─► ...
+```
 
-### 4.2 有界指数退避
+因此恢复必须同时解决两个问题：
 
-每个 pane 的 `PaneState` 记录：
+- **识别问题**：旧 watcher 没有把这条精确文本纳入事件集合；
+- **节流问题**：识别后不能每个 0.5 秒 poll 都发送一次。
 
-- 已观察到的 429 次数；
-- 最近一次 429 时间；
-- 本次恢复允许发送的时间点。
+Goal 行还增加了第三个问题：普通 `Continue` 和 `/goal resume` 的语义不同。
 
-新渲染的 429 使用以下延迟：
+## 6. watcher 的状态机：从画面到一次输入
 
-| 第几次新 429 | 等待时间 |
+插件每个 0.5 秒轮询一次，但“轮询”不等于“发送”。每个 pane 有一个独立
+的 `PaneState`，保存上一次画面中的事件、进程身份、尺寸、pending 事件、
+退避计数和最近发送时间。
+
+完整流程如下：
+
+```text
+┌──────────────┐
+│ 发现 pane     │ list-panes
+└──────┬───────┘
+       ▼
+┌────────────────┐      否
+│ 前台组是 Codex? │────────────► 丢弃该 pane
+└──────┬─────────┘
+       │是
+       ▼
+┌────────────────┐
+│ capture-pane    │ 读取 viewport + 有限 scrollback
+└──────┬─────────┘
+       ▼
+┌────────────────┐      否
+│ 严格事件匹配?   │────────────► 仅更新 baseline
+└──────┬─────────┘
+       │是
+       ▼
+┌────────────────┐
+│ appended_events │ 去重：是不是新渲染的一次事件？
+└──────┬─────────┘
+       ▼
+┌────────────────┐      是
+│ pane mode?      │────────────► 有界暂存，不注入
+└──────┬─────────┘
+       │否
+       ▼
+┌────────────────┐
+│ settle window   │ 等待 TUI 停止重绘（1.5s）
+└──────┬─────────┘
+       ▼
+┌────────────────────────────┐
+│ 429? 当前 Goal 属于哪一类？ │
+└──────┬─────────────────────┘
+       │
+       ├─ 可恢复 Goal ─► 选择 `/goal resume`
+       ├─ 没有 Goal ───► 选择 `Continue`
+       └─ 终态 Goal ───► 取消，不发送
+       ▼
+┌────────────────┐
+│ bounded backoff │ 429 等待 60/120/300/600/900s
+└──────┬─────────┘
+       ▼
+┌─────────────────────────┐      任一失败
+│ 发送前重新 capture/校验  │────────────► 清除 pending，fail closed
+└──────┬──────────────────┘
+       │全部通过
+       ▼
+┌─────────────────────────────────────────┐
+│ set-buffer → bracketed paste → Enter    │
+└─────────────────────────────────────────┘
+```
+
+### 6.1 baseline：为什么 watcher 启动时不立即重放旧错误
+
+watcher 启动或重启时，会把当时已经存在的事件保存为 baseline。否则只要 pane
+里还留着昨天的 429，重启 watcher 就会误认为它是刚发生的新错误，再提交一次
+输入。baseline 是“只处理 watcher 运行期间新观察到的变化”的边界。
+
+### 6.2 appended event：为什么同一行不会每半秒触发一次
+
+`capture-pane` 每次都可能返回相同的滚动历史。插件把前后事件列表做尾部/头部
+重叠匹配，只把新增部分视为 `new_events`。同一条错误保持在屏幕上时，事件
+身份不变；Codex 再次渲染一条新的错误记录时，才会出现新的事件。
+
+### 6.3 settle window：为什么不是一匹配就发
+
+TUI 可能先画错误头，再画 Goal 状态行，再把 composer 恢复出来。立即注入会
+和重绘竞争，导致输入被写入错误位置。短暂 settle window 允许界面稳定，发送
+前还会重新 capture，因此 settle 不是唯一安全措施。
+
+### 6.4 bounded backoff：为什么是 60/120/300/600/900 秒
+
+429 的根因是请求太早或额度未恢复；短间隔重试会放大问题。每个 pane 的新
+429 使用有界序列：
+
+| 新渲染的第几次 429 | 延迟 |
 | ---: | ---: |
-| 1 | 1 分钟 |
-| 2 | 2 分钟 |
-| 3 | 5 分钟 |
-| 4 | 10 分钟 |
-| 5 及以后 | 15 分钟封顶 |
+| 1 | 60 秒 |
+| 2 | 120 秒 |
+| 3 | 300 秒 |
+| 4 | 600 秒 |
+| 5 及以后 | 900 秒封顶 |
 
-其他 Codex 事件会重置该退避序列；超过 30 分钟没有新 429 后，下一次 429 也从 1 分钟开始。这样既不会把一次偶发限流永久放大，也不会在服务恢复后一直保持旧的长延迟。
+其他 Codex 事件会重置序列；30 分钟没有新 429 也会重置。这样一次偶发限流
+不会永久污染这个 pane，同时连续限流不会变成请求风暴。
 
-### 4.3 保持原有 fail-closed 发送门槛
+### 6.5 deferred event：为什么 copy-mode 下不能简单丢弃
 
-即使退避时间到了，发送前仍要满足所有原有条件：
+429 的第一次退避就是 60 秒，而普通 pane-mode 暂存窗口只有 30 秒。如果在
+copy-mode 里观察到 429，不能让普通 TTL 在 30 秒时把它丢掉；该事件会保留到
+计划重试时间之后的有限窗口，但退出 mode 后仍必须重新确认画面没有变化。
 
-1. pane 的前台进程组仍是已验证的 npm Codex native binary；
-2. pane 不在 copy-mode 或其他 tmux mode；
-3. watcher 的全局开关仍是 `on`；
-4. composer 为空，用户没有正在输入；
-5. 429 仍是当前终端事件；
-6. 没有安全菜单接管键盘；
-7. pane geometry、进程 identity 和当前 viewport 没有发生不允许的变化。
+## 7. “当前事件”检查为什么这么严格
 
-### 4.4 只放行截图中的状态 trailer
+滚动历史里出现过一个错误，不代表现在还应该对它操作。发送前的检查至少
+包括：
 
-对 `RATE_LIMIT` 的当前事件检查，会严格忽略这一类状态行：
+1. **精确错误行**：必须是列 0 的 `■ exceeded retry limit...`；缩进、引用、
+   改写文案或改成 500 都不匹配。
+2. **事件位置**：429 必须是当前事件列表的最后一个可操作错误。
+3. **合法 Goal 证据**：429 后可以有严格格式的 `• Goal ...` trailer；当前
+   viewport 的 footer 也可以是严格的 `Pursuing goal`、`Goal stalled
+   (/goal resume)` 等文案。前者必须属于最后一次 429，不能借用滚动历史里的
+   旧 Goal；后者必须仍是当前屏幕 footer，而不是普通回答里提到这些单词。
+4. **其他输出拒绝**：`• Ran ...`、新的 `■`、用户输入或未知行都会取消
+   旧 pending。
+5. **composer 空**：底部必须是空的 `› `，不能覆盖用户已经输入的文字。
+6. **没有 tmux mode**：copy-mode、选择菜单等都拥有键盘。
+7. **进程身份没变**：再次读取前台进程组和 native Codex 路径。
+8. **watcher 仍启用**：用户按 toggle 关闭后，所有 pending 都失效。
 
-```text
-• Goal active Objective: <non-empty objective> Time: <duration>.
-```
+这是一种 fail-closed 策略：证据不足时宁可不恢复，也不把命令发到错误的
+shell、另一个 pane 或用户的半成品输入里。
 
-例如截图中的 `Time: 58m.`。该例外只作用于 429 事件；如果后面出现 `• Ran ...`、新的错误、用户输入或其他未知输出，恢复仍会被取消。
+## 8. 429 + Goal 的具体判定与动作
 
-### 4.5 pane mode 下的延迟保持
+### 8.1 判定输入
 
-普通 deferred event 的保留窗口是 30 秒，但 429 的第一阶段退避是 60 秒。若 429 恰好在 copy-mode 中出现，不能因为普通 30 秒窗口到期而把它丢掉。因此 429 deferred event 会保留到“计划重试时间 + 30 秒”，同时发送前仍重新检查 live viewport；超出该边界后 fail closed。
-
-## 5. 代码路径
-
-主要改动集中在 `bin/tmux-codex-auto-continue`：
-
-- `RATE_LIMIT_RE`：严格识别 429 文案；
-- `event_records()`：把文本转换成 `rate_limit` 事件；
-- `PaneState`：保存退避计数、最近观察时间和 `retry_after`；
-- `observe_rate_limit_events()`：计算并记录 1/2/5/10/15 分钟退避；
-- `schedule_pending()`：把 429 的计划发送时间纳入 pending event；
-- `terminal_event_is_current_text()`：允许严格的 `Goal active` trailer；
-- `expire_deferred_events()`：为 pane-mode 下的 429 保留足够长的边界。
-
-发送动作仍复用原来的 `submit_text()`，所以实际输入序列没有另起一套不安全的实现：
+watcher 不读取 Goal 数据库，也不猜测 objective 内容。它只从当前 pane 的
+两种官方渲染结构识别状态：
 
 ```text
-tmux set-buffer Continue
-tmux paste-buffer -p
-tmux send-keys Enter
+• Goal <status> Objective: <非空文本> Time: <合法时长>.
+
+                                      Goal stalled (/goal resume)
 ```
 
-## 6. 如何验证
+其中 `<status>` 的恢复集合是：
 
-单元/self-test 覆盖：
+- `active`
+- `paused`
+- `stalled`（Codex 内部通常对应 blocked）
+- `usage limited`
 
-- 正确 429 文案识别；
-- `---` 后缀识别；
-- 引用、缩进、改状态码和改文案拒绝；
-- `Goal active` trailer 可接受；
-- 其他后续输出仍拒绝；
-- 退避序列为 60/120/300/600/900 秒；
-- 其他事件和 30 分钟空闲后退避重置；
-- pane-mode 中的 429 不在普通 30 秒窗口内误丢失。
+`complete` 和 `limited by budget` 是终止/硬限制状态，不在自动恢复集合中。
+`Time` 的合法形式不只包括 `58m`，还包括 `30s`、`2h`、`1h 2m` 和带天数的
+组合；整小时不能因为没有分钟字段而漏判。
 
-隔离 tmux integration test 使用 native fake-Codex 进程，注入截图同构的错误和状态行，验证：
+### 8.2 动作矩阵
 
-1. 429 出现后 3 秒内不会发送 `Continue`；
-2. 约 60 秒后只发送一次 `Continue`；
-3. 不需要创建或重启 pane；
-4. 现有普通错误、上下文压缩、安全菜单和 watcher restart 回归不受影响。
+```text
+                    当前 Goal 状态
+                 ┌───────────────────────┐
+                 │ recoverable?           │
+                 └──────────┬────────────┘
+                            │
+             ┌──────────────┴──────────────┐
+             │                             │
+             ▼                             ▼
+       有 429 + Goal                  有 429 + 无 Goal
+             │                             │
+             ▼                             ▼
+       `/goal resume`                 `Continue`
+```
 
-本地完整集成测试命令：
+如果证据表明 Goal 已 complete/limited by budget，第三条分支是不发送。这里
+不能把“有一个终态 Goal”降级成“没有 Goal”，否则 `Continue` 会偷偷开启一个
+本不该开启的新 turn。
+
+这条分支必须在**实际发送前**再次计算，而不是只在第一次发现错误时计算。
+因为用户可能在等待 60 秒期间手动暂停/清除 Goal，也可能已经手动恢复了它。
+发送前看到的状态才是最终依据。
+
+### 8.3 为什么不会把 `/goal resume` 发给普通 pane
+
+`/goal resume` 是 Codex TUI 的 slash command；普通 shell、非 Codex pane 或
+没有 Goal 的 Codex pane 不应该收到它。进程身份、严格 Goal 状态行、当前 429、
+空 composer 四个条件共同构成门槛。缺一个就回到 `Continue`（如果仍有普通
+429 恢复资格）或直接取消。
+
+## 9. 实际输入是怎样注入的
+
+发送 `/goal resume` 和发送 `Continue` 使用同一个安全路径，只有字符串不同：
+
+```text
+1. tmux set-buffer -- "/goal resume"
+2. tmux paste-buffer -p -d -t <pane>
+3. tmux send-keys -t <pane> Enter
+```
+
+`paste-buffer -p` 使用 bracketed paste。原因是 Codex TUI 会把快速连续的字符
+当作 paste burst；如果在字符事件中间直接发送 Enter，Enter 可能被当成换行而
+不是提交。先完成一次明确的 paste，再发送独立的真实 Enter，顺序更可靠。
+
+插件不调用 `xdotool`，不发送全局键，不操作鼠标，也不把命令写进 shell 历史。
+输入直接进入指定 pane 的 PTY。
+
+## 10. 代码结构和概念的对应关系
+
+主要实现位于 [`bin/tmux-codex-auto-continue`](../bin/tmux-codex-auto-continue)：
+
+| 概念 | 代码职责 |
+| --- | --- |
+| 事件词法识别 | `RATE_LIMIT_RE`、Goal 状态正则和 `event_records()` |
+| pane 身份 | `list_panes()`、`codex_process_identity()`、`/proc` 读取 |
+| 当前画面 | `capture_visible_text()`、`capture_event_text()` |
+| 去重 | `appended_events()` |
+| 当前事件验证 | `terminal_event_is_current_text()`、`terminal_suffix_is_idle()` |
+| 429 退避 | `PaneState.rate_limit_*`、`observe_rate_limit_events()` |
+| pending/deferred | `schedule_pending()`、`defer_events()`、`expire_deferred_events()` |
+| Goal/普通动作选择 | Goal 状态解析及发送前的动作重判定 |
+| 输入注入 | `submit_text()` |
+| watcher 单实例 | socket 派生 lock 文件和 `run_daemon()` |
+
+这里的 `PaneState` 是 watcher 自己的内存状态，不是 Codex 的 Goal 状态。两者
+不要混淆：
+
+```text
+Codex Goal 状态 ──通过 TUI 状态行被观察──► watcher PaneState
+watcher PaneState ──通过 tmux 输入──► Codex TUI 命令
+```
+
+watcher 重启后会丢失自己的退避计数并重新 baseline；它不会因此删除或创建
+Codex Goal。
+
+## 11. 如何测试：每个测试证明什么
+
+### 11.1 纯函数 self-test
 
 ```sh
 python3 bin/tmux-codex-auto-continue --self-test
-python3 tests/worked_integration.py
-python3 tests/install_integration.py
-python3 -m py_compile bin/tmux-codex-auto-continue tests/worked_integration.py tests/install_integration.py
-sha256sum --check SHA256SUMS
 ```
 
-## 7. 边界和不能承诺的事情
+覆盖的不是“字符串能不能搜到”，而是状态机边界：
 
-- 这不是 Codex 官方的 session/goal API，也不会修改 Codex 的内部 goal 文件或服务端状态。
-- watcher 启动时会 baseline 已经存在的终端文本，不会盲目重放启动前的旧 429；这样可以避免安装/重启 watcher 时误触发历史请求。
-- 如果 Codex 版本改变 UI 文案或布局，未知布局会被忽略；需要新增精确 fixture 和回归测试后再支持。
-- 如果账号/模型本身仍处于 usage limit，`Continue` 可能再次得到 429；退避会继续加长并封顶，不保证服务端一定恢复。
-- watcher 只负责当前 pane 的输入恢复，不负责跨重启的 Codex 进程恢复、goal 持久化、权限批准、GPU/远程任务租约或业务 checkpoint。
+- 正确 429 文案和允许的 `---` 尾缀；
+- 去掉 `■`、加缩进、加 `›` 引用、改状态码、改英文文案均拒绝；
+- active/paused/stalled/usage-limited Goal trailer 与 footer 的识别；
+- complete/limited-by-budget 不选择 `/goal resume` 或 `Continue`；
+- 429 + Goal 选择 `/goal resume`；
+- 429 + 无 Goal 选择 `Continue`；
+- 旧 429 前后的 Goal 不能被错误地借给当前 429；
+- `Time: 2h.` 这样的整点时长不会漏判；
+- 新输出、手动输入、Goal 状态消失会取消旧事件；
+- 退避序列和重置条件；
+- pane-mode 延迟事件的保留边界。
 
-## 8. 一句话总结
+### 11.2 worked integration
 
-原问题是“429 错误没有被识别”；真正的修复是“识别 429 + 保留当前 goal + 有界退避 + 严格重验证 + 只忽略合法的 Goal 状态 trailer”，而不是简单地多按几次 Enter。
+```sh
+python3 tests/worked_integration.py
+```
+
+该测试启动隔离的 tmux server 和一个 native fake-Codex 进程，不接触真实
+账号或模型服务。它验证真实 tmux 输入路径：
+
+1. 普通可恢复事件仍收到 `Continue`；
+2. 429 + Goal 状态在短时间内不会发送任何输入；
+3. 第一阶段退避结束后收到且只收到一次字面量 `/goal resume`；
+4. 不创建、重命名、重启或杀死测试 pane；
+5. copy-mode、菜单、手动输入、watcher 重启和安装迁移回归不受影响。
+
+“429 无 Goal -> `Continue`”的分支由 self-test 覆盖；集成测试重点证明真正
+经过 tmux bracketed-paste 和 Enter 后，fake Codex 收到的是 `/goal resume`，
+而不是只在 Python 函数里算出了这个字符串。
+
+### 11.3 其他检查
+
+```sh
+python3 tests/install_integration.py
+python3 -m py_compile bin/tmux-codex-auto-continue \
+  tests/worked_integration.py tests/install_integration.py
+sha256sum --check SHA256SUMS
+git diff --check
+```
+
+如果本机没有 `ruff` 或 `shellcheck`，应明确记录为未运行，而不是把它们的
+结果猜成通过。
+
+## 12. 安全边界和不能解决的事情
+
+### 能解决
+
+- watcher 运行期间，准确识别当前 pane 的 429 retry-limit 文案；
+- 在限流窗口内停止重复请求；
+- 保留同一个 Codex pane/thread，不新建 session；
+- 有 Goal 时使用 `/goal resume`，无 Goal 时使用 `Continue`；
+- 用户接管键盘、改变 pane 或关闭 watcher 时 fail closed。
+
+### 不能保证
+
+- 账号额度已经恢复；如果服务端仍拒绝，下一次仍可能是 429；
+- Codex 改变英文 UI 文案或状态行布局后的兼容性；未知布局会被忽略；
+- watcher 自己重启后恢复之前内存里的退避计数；
+- 跨机器、跨 tmux server、跨 Codex session 的任务调度；
+- Goal 数据库、权限审批、模型选择、业务 checkpoint 或远程 GPU 租约；
+- 把已经 complete/limited-by-budget 的 Goal 强行重新打开。
+
+### 为什么这些边界是必要的
+
+如果插件直接改 Codex 的内部数据库或绕过 CLI 状态机，它可能让 UI 显示 active
+但 runtime 仍是 paused，造成更难排查的“假恢复”。当前设计只使用 Codex 自己
+公开给终端用户的 `/goal resume` 命令，因此状态转换仍由 Codex 完成。
+
+## 13. 从用户视角的最短操作说明
+
+```text
+你继续照常在 tmux 里运行 Codex。
+
+出现 429 时：
+  1. watcher 先等待，不会立刻连发请求；
+  2. 如果画面显示可恢复 Goal 状态，等待结束后输入 /goal resume；
+  3. 如果没有 Goal，等待结束后输入 Continue；
+  4. 如果你正在 copy-mode、输入文字或关闭 watcher，自动动作会取消。
+```
+
+可以用下面的命令观察 watcher 是否运行：
+
+```sh
+~/.local/bin/tmux-codex-auto-continue \
+  --socket "$(tmux display-message -p '#{socket_path}')" --status
+tail -f ~/.cache/tmux-codex-auto-continue.log
+```
+
+日志只记录 pane/session 标识和动作类型，不记录完整 pane 内容。
+
+## 14. 参考资料
+
+- [项目仓库：tmux-codex-auto-continue](https://github.com/yeahdongcn/tmux-codex-auto-continue)
+- [Codex CLI developer commands（含 `/goal resume`）](https://developers.openai.com/codex/cli/slash-commands)
+- [Codex Follow a goal](https://developers.openai.com/codex/use-cases/follow-goals)
+- [Codex continuation prompt（官方开源仓库）](https://github.com/openai/codex/blob/main/codex-rs/prompts/templates/goals/continuation.md)
+- [Codex TUI Goal 状态与命令提示源码](https://github.com/openai/codex/blob/main/codex-rs/tui/src/chatwidget/goal_menu.rs)
+- [Codex 0.147.0 TUI footer 状态映射源码](https://github.com/openai/codex/blob/rust-v0.147.0/codex-rs/tui/src/bottom_pane/footer.rs)
+- [tmux 手册](https://man7.org/linux/man-pages/man1/tmux.1.html)
+- [`proc_pid_stat(5)`：进程组和前台进程组字段](https://man7.org/linux/man-pages/man5/proc_pid_stat.5.html)
