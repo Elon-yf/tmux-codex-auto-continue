@@ -740,6 +740,12 @@ def pane_cursor_x(socket: str, pane: str) -> int | None:
         return None
 
 
+def composer_is_empty(cursor_x: int | None) -> bool:
+    """Return whether tmux confirms the composer is still at its empty cell."""
+
+    return cursor_x == EMPTY_COMPOSER_CURSOR_X
+
+
 def capture_event_text(socket: str, pane: str) -> str | None:
     result = run_tmux(
         socket,
@@ -1001,7 +1007,7 @@ def submit_text(
     three tmux commands are queued together server-side to preserve ordering.
     """
 
-    if pane_cursor_x(socket, pane) != EMPTY_COMPOSER_CURSOR_X:
+    if not composer_is_empty(pane_cursor_x(socket, pane)):
         log(f"skipped pane {pane}: composer is not empty or not ready")
         return SubmitResult()
 
@@ -1039,6 +1045,13 @@ def submit_text(
         if reply is None:
             log(f"skipped pane {pane}: Goal is terminal")
             return SubmitResult()
+
+    # A user can begin typing after the first composer check while the event
+    # and Goal state are being revalidated. Check again immediately before
+    # queuing paste plus Enter so their input is never overwritten or sent.
+    if not composer_is_empty(pane_cursor_x(socket, pane)):
+        log(f"skipped pane {pane}: composer changed before submission")
+        return SubmitResult()
 
     submitted = run_tmux(
         socket,
@@ -1728,6 +1741,9 @@ def self_test() -> int:
     assert tmux_mode_active("2")
     assert tmux_mode_active("")
     assert tmux_mode_active("unexpected")
+    assert composer_is_empty(EMPTY_COMPOSER_CURSOR_X)
+    assert not composer_is_empty(EMPTY_COMPOSER_CURSOR_X + 1)
+    assert not composer_is_empty(None)
 
     retry_sample = "\n".join(
         [
