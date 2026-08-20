@@ -8,6 +8,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -15,6 +16,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 WATCHER = ROOT / "bin" / "tmux-codex-auto-continue"
 SUBMITTED_MARKER = "__CONTINUE_SUBMITTED__"
+GOAL_RESUME_MARKER = "__GOAL_RESUME_SUBMITTED__"
 COMPACT_SUBMITTED_MARKER = "__COMPACT_SUBMITTED__"
 
 
@@ -26,7 +28,17 @@ def main() -> int:
     home_dir = temporary_root / "home"
     home_dir.mkdir(mode=0o700)
     fake_codex = (
-        temporary_root / "@openai" / "codex" / "vendor" / "bin" / "codex"
+        temporary_root
+        / "node_modules"
+        / "@openai"
+        / "codex"
+        / "node_modules"
+        / "@openai"
+        / "codex-linux-arm64"
+        / "vendor"
+        / "aarch64-unknown-linux-musl"
+        / "bin"
+        / "codex"
     )
     fake_codex.parent.mkdir(parents=True)
     shutil.copy2("/bin/bash", fake_codex)
@@ -36,7 +48,9 @@ def main() -> int:
         "PS1='› '\n"
         f"Continue() {{ printf '%s\\n' {SUBMITTED_MARKER}; }}\n"
         "trap 'if [[ \"$BASH_COMMAND\" == \"/compact\" ]]; then "
-        f"printf \"%s\\\\n\" {COMPACT_SUBMITTED_MARKER}; fi' DEBUG\n",
+        f"printf \"%s\\\\n\" {COMPACT_SUBMITTED_MARKER}; "
+        f"elif [[ \"$BASH_COMMAND\" == \"/goal resume\" ]]; then "
+        f"printf \"%s\\\\n\" {GOAL_RESUME_MARKER}; fi' DEBUG\n",
         encoding="utf-8",
     )
 
@@ -61,6 +75,16 @@ def main() -> int:
     def capture() -> str:
         return tmux("capture-pane", "-p", "-S", "-1000", "-t", "0").stdout
 
+    def capture_target(target: str) -> str:
+        return tmux(
+            "capture-pane",
+            "-p",
+            "-S",
+            "-1000",
+            "-t",
+            target,
+        ).stdout
+
     def send_line(line: str) -> None:
         typed = tmux("send-keys", "-t", "0", "-l", line)
         assert typed.returncode == 0, typed.stderr
@@ -77,7 +101,30 @@ def main() -> int:
         watcher_log.flush()
         return f"{capture()}\nWATCHER LOG:\n{watcher_log_path.read_text()}"
 
+    rate_limit = "■ exceeded retry limit, last status: 429 Too Many Requests"
+
     try:
+        unavailable_restart = subprocess.run(
+            [
+                sys.executable,
+                str(WATCHER),
+                "--socket",
+                f"{socket}-unavailable",
+                "--restart",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            env=environment,
+        )
+        assert unavailable_restart.returncode == 1, unavailable_restart.stdout
+        assert (
+            "failed to query tmux auto-continue option"
+            in unavailable_restart.stdout
+        )
+
         created = tmux(
             "new-session",
             "-d",
@@ -91,6 +138,13 @@ def main() -> int:
         enabled = tmux("set-option", "-g", "@codex-auto-continue", "on")
         assert enabled.returncode == 0, enabled.stderr
 
+        # The first daemon-wide scan is a baseline. A 429 that predates daemon
+        # startup must not be replayed merely because it remains in scrollback.
+        emit_lines(
+            rate_limit,
+            "• Goal active Objective: old startup event Time: 58m.",
+        )
+
         watcher = subprocess.Popen(
             ["python3", str(WATCHER), "--socket", socket],
             stdout=watcher_log,
@@ -99,8 +153,10 @@ def main() -> int:
             errors="replace",
             env=environment,
         )
-        time.sleep(1.5)
+        time.sleep(3.0)
         assert watcher.poll() is None, "watcher exited before the test"
+        assert capture().count(SUBMITTED_MARKER) == 0, diagnostics()
+        assert capture().count(GOAL_RESUME_MARKER) == 0, diagnostics()
 
         # A normal completion has Codex's final-response separator immediately
         # before the final response block and must never be continued.
@@ -219,7 +275,7 @@ def main() -> int:
             if capture().count(SUBMITTED_MARKER) == 4:
                 break
             time.sleep(0.25)
-        assert capture().count(SUBMITTED_MARKER) == 4, capture()
+        assert capture().count(SUBMITTED_MARKER) == 4, diagnostics()
 
         emit_lines(*(f"  {line}" for line in cyber_risk_flagged))
         time.sleep(2.5)
@@ -415,14 +471,137 @@ def main() -> int:
             time.sleep(0.25)
         assert capture().count(SUBMITTED_MARKER) == 11, diagnostics()
 
+        # A 429 retry-limit marker is recovered after a fixed two-second
+        # interval rather than on every poll. The unit test covers fixed-delay
+        # de-duplication and this integration test verifies that an active
+        # Goal uses the literal `/goal resume` command.
+        emit_lines(
+            rate_limit,
+            "• Goal active Objective: resume this work Time: 58m.",
+        )
+        time.sleep(1.0)
+        assert capture().count(SUBMITTED_MARKER) == 11, diagnostics()
+        assert capture().count(GOAL_RESUME_MARKER) == 0, diagnostics()
+        deadline = time.monotonic() + 7
+        while time.monotonic() < deadline:
+            if GOAL_RESUME_MARKER in capture():
+                break
+            time.sleep(0.25)
+        assert capture().count(GOAL_RESUME_MARKER) == 1, diagnostics()
+        assert capture().count(SUBMITTED_MARKER) == 11, diagnostics()
+
+        # Polling the unchanged rendered 429 must not submit again. A second
+        # newly rendered 429 is a new server response and gets the same fixed
+        # two-second delay before one more Goal resume.
+        time.sleep(3.0)
+        assert capture().count(GOAL_RESUME_MARKER) == 1, diagnostics()
+        emit_lines(
+            rate_limit,
+            "• Goal stalled Objective: resume this work Time: 58m.",
+        )
+        time.sleep(1.0)
+        assert capture().count(GOAL_RESUME_MARKER) == 1, diagnostics()
+        deadline = time.monotonic() + 7
+        while time.monotonic() < deadline:
+            if capture().count(GOAL_RESUME_MARKER) == 2:
+                break
+            time.sleep(0.25)
+        assert capture().count(GOAL_RESUME_MARKER) == 2, diagnostics()
+        assert capture().count(SUBMITTED_MARKER) == 11, diagnostics()
+
+        # A terminal Goal is not resumable, but the current 429 still proves
+        # that the ordinary turn was interrupted. It therefore falls back to
+        # Continue instead of being silently discarded.
+        emit_lines(
+            rate_limit,
+            "• Goal complete Objective: finished this work Time: 58m.",
+        )
+        time.sleep(1.0)
+        assert capture().count(SUBMITTED_MARKER) == 11, diagnostics()
+        deadline = time.monotonic() + 7
+        while time.monotonic() < deadline:
+            if capture().count(SUBMITTED_MARKER) == 12:
+                break
+            time.sleep(0.25)
+        assert capture().count(SUBMITTED_MARKER) == 12, diagnostics()
+        assert capture().count(GOAL_RESUME_MARKER) == 2, diagnostics()
+
+        # The daemon is scoped to the tmux server, not one session. A session
+        # created after the daemon baseline may already show a current 429 on
+        # the first poll. Recover it instead of treating that first frame as
+        # old startup scrollback.
+        dynamic_session = "dynamic-new-session"
+        dynamic_script = (
+            "printf '%s\\n' "
+            + shlex.quote(rate_limit)
+            + " "
+            + shlex.quote(
+                "• Goal achieved Objective: first-frame failure Time: 58m."
+            )
+            + "; exec "
+            + shlex.quote(str(fake_codex))
+            + " --noprofile --rcfile "
+            + shlex.quote(str(bash_rc))
+            + " -i"
+        )
+        dynamic_created = tmux(
+            "new-session",
+            "-d",
+            "-s",
+            dynamic_session,
+            "-x",
+            "120",
+            "-y",
+            "24",
+            (
+                f"{shlex.quote(str(fake_codex))} --noprofile "
+                f"--rcfile {shlex.quote(str(bash_rc))} -i -c "
+                f"{shlex.quote(dynamic_script)}"
+            ),
+        )
+        assert dynamic_created.returncode == 0, dynamic_created.stderr
+        time.sleep(1.0)
+        dynamic_capture = capture_target(f"{dynamic_session}:0.0")
+        assert dynamic_capture.count(SUBMITTED_MARKER) == 0, dynamic_capture
+        deadline = time.monotonic() + 7
+        while time.monotonic() < deadline:
+            dynamic_capture = capture_target(f"{dynamic_session}:0.0")
+            if dynamic_capture.count(SUBMITTED_MARKER) == 1:
+                break
+            time.sleep(0.25)
+        assert dynamic_capture.count(SUBMITTED_MARKER) == 1, dynamic_capture
+        assert dynamic_capture.count(GOAL_RESUME_MARKER) == 0, dynamic_capture
+
+        # tmux can retain the PATH from when its server started. Reproduce a
+        # server environment that cannot resolve the `tmux` command, then make
+        # restart launch the replacement through `run-shell -b`. The daemon
+        # must recover the exact server executable from TMUX plus /proc.
+        empty_path = temporary_root / "empty-path"
+        empty_path.mkdir()
+        hidden_tmux = tmux(
+            "set-environment",
+            "-g",
+            "PATH",
+            str(empty_path),
+        )
+        assert hidden_tmux.returncode == 0, hidden_tmux.stderr
+        server_pid_result = tmux("display-message", "-p", "#{pid}")
+        assert server_pid_result.returncode == 0, server_pid_result.stderr
+        restart_environment = environment.copy()
+        restart_environment["PATH"] = str(empty_path)
+        restart_environment["TMUX"] = (
+            f"{socket},{int(server_pid_result.stdout.strip())},-1"
+        )
+        restart_environment.pop("TMUX_CODEX_AUTO_CONTINUE_TMUX", None)
+
         restarted = subprocess.run(
-            ["python3", str(WATCHER), "--socket", socket, "--restart"],
+            [sys.executable, str(WATCHER), "--socket", socket, "--restart"],
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             encoding="utf-8",
             errors="replace",
             check=False,
-            env=environment,
+            env=restart_environment,
         )
         assert restarted.returncode == 0, restarted.stdout
         watcher.wait(timeout=5)
@@ -451,8 +630,25 @@ def main() -> int:
         assert status.returncode == 0, status.stdout
         replacement = re.search(r"\bdaemon=(\d+)\b", status.stdout)
         assert replacement is not None, status.stdout
-        assert int(replacement.group(1)) != watcher.pid
+        replacement_pid = int(replacement.group(1))
+        assert replacement_pid != watcher.pid
         assert "worked=" not in status.stdout
+
+        # A queued run-shell can briefly publish its lock before failing its
+        # first poll. Require the replacement to survive multiple poll cycles
+        # with the server PATH still unable to resolve a bare `tmux` command.
+        time.sleep(2.0)
+        persistent_status = subprocess.run(
+            ["python3", str(WATCHER), "--socket", socket, "--status"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            env=environment,
+        )
+        assert persistent_status.returncode == 0, persistent_status.stdout
+        assert f"daemon={replacement_pid}" in persistent_status.stdout
         print("worked-integration: PASS")
         return 0
     finally:

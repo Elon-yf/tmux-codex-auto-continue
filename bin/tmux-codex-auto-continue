@@ -8,11 +8,13 @@ It only sends input when the foreground process group is a Codex CLI process.
 from __future__ import annotations
 
 import argparse
+import base64
 import fcntl
 import hashlib
 import os
 import re
 import shlex
+import shutil
 import signal
 import subprocess
 import sys
@@ -25,6 +27,11 @@ SETTLE_SECONDS = 1.5
 MIN_SEND_GAP_SECONDS = 2.0
 DEFERRED_EVENT_TTL_SECONDS = 30.0
 CONTEXT_COMPACTION_TTL_SECONDS = 5 * 60.0
+# Treat each newly rendered 429 as the same ordinary recovery interval. The
+# event de-duplication and live-terminal checks still prevent replaying one
+# stale line, while a new server response can be retried after two seconds.
+RATE_LIMIT_RETRY_DELAYS_SECONDS = (2.0,)
+RATE_LIMIT_RETRY_RESET_SECONDS = 30 * 60.0
 MIN_MENU_ATTEMPT_GAP_SECONDS = 2.0
 MENU_REDRAW_TIMEOUT_SECONDS = 0.75
 MENU_REDRAW_POLL_SECONDS = 0.05
@@ -35,7 +42,25 @@ REPLY = "Continue"
 COMPACT_COMMAND = "/compact"
 OPTION_NAME = "@codex-auto-continue"
 EMPTY_COMPOSER_CURSOR_X = 2
-VERSION = "0.2.7"
+VERSION = "0.2.8"
+CODEX_NATIVE_PACKAGE_TAILS = frozenset(
+    {
+        (
+            "codex-linux-arm64",
+            "vendor",
+            "aarch64-unknown-linux-musl",
+            "bin",
+            "codex",
+        ),
+        (
+            "codex-linux-x64",
+            "vendor",
+            "x86_64-unknown-linux-musl",
+            "bin",
+            "codex",
+        ),
+    }
+)
 
 # Requiring Codex's exact event glyph and structure in column zero avoids
 # matching quoted text in user prompts, assistant messages, or shell output.
@@ -58,6 +83,54 @@ SERVER_OVERLOADED_RE = re.compile(
     r"(?:[ \t]+---)?[ \t]*$",
     re.MULTILINE,
 )
+RATE_LIMIT_RE = re.compile(
+    r"^■ exceeded retry limit, last status: 429 Too Many Requests"
+    r"(?:[ \t]+---)?[ \t]*$",
+    re.MULTILINE,
+)
+GOAL_DURATION_RE = r"(?:\d+s|\d+m|\d+h(?: \d+m)?|\d+d \d+h \d+m)"
+GOAL_COMPACT_TOKENS_RE = r"\d+(?:\.\d+)?[KMBT]?"
+GOAL_STATUS_RE = re.compile(
+    r"^• Goal (?P<status>active|paused|stalled|blocked|usage limited|"
+    r"limited by budget|budget limited|complete|achieved|unmet|abandoned) "
+    r"Objective: "
+    r"\S(?:.*?\S)?"
+    rf"(?: Time: {GOAL_DURATION_RE}\.)?"
+    rf"(?: Tokens: {GOAL_COMPACT_TOKENS_RE}/{GOAL_COMPACT_TOKENS_RE}\.)?"
+    r"[ \t]*$",
+    re.MULTILINE,
+)
+GOAL_RESUMABLE_STATUSES = frozenset(
+    {"active", "paused", "stalled", "blocked", "usage limited"}
+)
+EMPTY_COMPOSER_RE = re.compile(
+    r"^(?:\[[A-Z][A-Z -]*\][ \t]+)?(?P<prompt>[›»])"
+    r"(?:[ \t]+\S(?:.*\S)?)?[ \t]*$",
+    re.MULTILINE,
+)
+GOAL_FOOTER_ACTIVE_USAGE_RE = (
+    rf"(?:{GOAL_COMPACT_TOKENS_RE} / {GOAL_COMPACT_TOKENS_RE}|"
+    rf"{GOAL_DURATION_RE})"
+)
+GOAL_FOOTER_UNMET_USAGE_RE = (
+    rf"{GOAL_COMPACT_TOKENS_RE} / {GOAL_COMPACT_TOKENS_RE} tokens"
+)
+GOAL_FOOTER_ACHIEVED_USAGE_RE = (
+    rf"(?:{GOAL_COMPACT_TOKENS_RE} tokens|{GOAL_DURATION_RE})"
+)
+GOAL_FOOTER_STATUS_RE = re.compile(
+    r"^ {2,}(?:\S(?:[^\n]*?\S)?[ \t]+)?(?P<status>"
+    rf"Pursuing goal(?: \({GOAL_FOOTER_ACTIVE_USAGE_RE}\))?|"
+    r"Goal paused \(/goal resume\)|"
+    r"Goal stalled \(/goal resume\)|"
+    r"Goal hit usage limits \(/goal resume\)|"
+    rf"Goal unmet \({GOAL_FOOTER_UNMET_USAGE_RE}\)|"
+    r"Goal abandoned|"
+    rf"Goal achieved(?: \({GOAL_FOOTER_ACHIEVED_USAGE_RE}\))?"
+    r")(?: · IDE context)?[ \t]*$",
+    re.MULTILINE,
+)
+ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 CONTEXT_TOO_LARGE_HEADER_RE = re.compile(
     r"^■ unexpected status 413 Payload Too Large:[ \t]*.*$",
     re.MULTILINE,
@@ -102,6 +175,7 @@ WORKED_COMPLETE = "worked_complete"
 WORKED_UNKNOWN = "worked_unknown"
 CONTEXT_TOO_LARGE = "context_too_large"
 CONTEXT_COMPACTED = "context_compacted"
+RATE_LIMIT = "rate_limit"
 NON_ACTIONABLE_EVENTS = frozenset(
     {WORKED_COMPLETE, WORKED_UNKNOWN, CONTEXT_COMPACTED}
 )
@@ -153,6 +227,10 @@ class PaneState:
     context_compacted_seen: bool = False
     context_retry_seen: bool = False
     context_compaction_started: float = 0.0
+    rate_limit_attempts: int = 0
+    rate_limit_last_seen: float = 0.0
+    rate_limit_retry_after: float = 0.0
+    rate_limit_terminal_latched: bool = False
     send_after: float = 0.0
     last_sent: float = 0.0
     last_menu_attempt: float = 0.0
@@ -160,15 +238,142 @@ class PaneState:
     safety_menu_absent_polls: int = 0
 
 
-def run_tmux(socket: str, *args: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["tmux", "-S", socket, *args],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
+@dataclass(frozen=True)
+class SubmitResult:
+    reply: str | None = None
+    preserve_pending: bool = False
+
+
+def tmux_server_pid_from_environment(
+    socket: str, tmux_environment: str
+) -> int | None:
+    """Return the tmux server PID encoded for this exact socket."""
+
+    parts = tmux_environment.rsplit(",", 2)
+    if len(parts) != 3 or not socket_paths_match(parts[0], socket):
+        return None
+    try:
+        server_pid = int(parts[1])
+    except ValueError:
+        return None
+    return server_pid if server_pid > 0 else None
+
+
+@dataclass(frozen=True)
+class TmuxCommand:
+    executable: str
+    environment: dict[str, str] | None = None
+
+
+def socket_paths_match(left: str, right: str) -> bool:
+    """Compare tmux socket identities without trusting textual aliases."""
+
+    if left == right:
+        return True
+    try:
+        return os.path.samefile(left, right)
+    except OSError:
+        return os.path.abspath(left) == os.path.abspath(right)
+
+
+def proc_environment_value(pid: int, name: str) -> str | None:
+    """Read one value from a same-owner Linux process environment."""
+
+    try:
+        entries = Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    except OSError:
+        return None
+    encoded_name = name.encode() + b"="
+    for entry in entries:
+        if entry.startswith(encoded_name):
+            return entry[len(encoded_name) :].decode(errors="surrogateescape")
+    return None
+
+
+def absolute_executable(path: str) -> str | None:
+    """Return a validated absolute executable path."""
+
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        return None
+    try:
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            return None
+    except OSError:
+        return None
+    return str(candidate)
+
+
+def tmux_command(socket: str) -> TmuxCommand:
+    """Resolve tmux even when the server's background PATH is minimal.
+
+    A tmux server may have started before a user-local tmux directory was
+    added to PATH. Commands launched with ``run-shell -b`` inherit that old
+    environment. In that case, the trusted ``TMUX`` tuple identifies the
+    exact server process, whose executable is available through ``/proc``.
+    """
+
+    override = absolute_executable(
+        os.environ.get("TMUX_CODEX_AUTO_CONTINUE_TMUX", "")
     )
+    if override is not None:
+        return TmuxCommand(override)
+
+    server_pid = tmux_server_pid_from_environment(
+        socket, os.environ.get("TMUX", "")
+    )
+    if server_pid is not None:
+        try:
+            proc_dir = Path(f"/proc/{server_pid}")
+            if proc_dir.stat().st_uid != os.getuid():
+                raise PermissionError("tmux server belongs to another user")
+            proc_executable = proc_dir / "exe"
+            executable = proc_executable.resolve(strict=True)
+            process_name = Path(f"/proc/{server_pid}/comm").read_text().strip()
+        except (OSError, RuntimeError):
+            pass
+        else:
+            if (
+                (process_name == "tmux" or process_name.startswith("tmux: "))
+                and executable.name == "tmux"
+                and os.access(executable, os.X_OK)
+            ):
+                environment = os.environ.copy()
+                for variable in ("LD_LIBRARY_PATH", "LD_PRELOAD"):
+                    server_value = proc_environment_value(
+                        server_pid, variable
+                    )
+                    if server_value is None:
+                        environment.pop(variable, None)
+                    else:
+                        environment[variable] = server_value
+                # Carry a stable absolute path into the child watcher. Keeping
+                # `/proc/<pid>/exe` would make a long-lived watcher vulnerable
+                # to PID reuse if this server exits and that PID is recycled.
+                return TmuxCommand(str(executable), environment)
+
+    discovered = shutil.which("tmux")
+    if discovered is not None:
+        return TmuxCommand(str(Path(discovered).resolve()))
+
+    return TmuxCommand("tmux")
+
+
+def run_tmux(socket: str, *args: str) -> subprocess.CompletedProcess[str]:
+    resolved = tmux_command(socket)
+    command = [resolved.executable, "-S", socket, *args]
+    try:
+        return subprocess.run(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            env=resolved.environment,
+        )
+    except OSError as error:
+        return subprocess.CompletedProcess(command, 127, "", str(error))
 
 
 def log(message: str) -> None:
@@ -222,7 +427,7 @@ def context_too_large_records(text: str) -> list[tuple[int, int, str]]:
     """Return strict, bounded matches for the internal 413 context error."""
 
     matches: list[tuple[int, int, str]] = []
-    event_line_re = re.compile(r"^[■─›•ⓘ⚠](?: |$)")
+    event_line_re = re.compile(r"^[■─›»•ⓘ⚠](?: |$)")
 
     for header in CONTEXT_TOO_LARGE_HEADER_RE.finditer(text):
         block = [header.group(0)]
@@ -263,7 +468,7 @@ def event_records(text: str) -> list[tuple[int, int, str]]:
         tail_lines = text[match.start() :].splitlines()
         block_lines = [tail_lines[0]]
         for line in tail_lines[1:16]:
-            if not line.strip() or re.match(r"^[■─›•] ", line):
+            if not line.strip() or re.match(r"^[■─›»•] ", line):
                 break
             block_lines.append(line)
         request_id = REQUEST_ID_RE.search("\n".join(block_lines))
@@ -280,6 +485,9 @@ def event_records(text: str) -> list[tuple[int, int, str]]:
 
     for match in SERVER_OVERLOADED_RE.finditer(text):
         matches.append((match.start(), match.end(), "server_overloaded"))
+
+    for match in RATE_LIMIT_RE.finditer(text):
+        matches.append((match.start(), match.end(), RATE_LIMIT))
 
     matches.extend(context_too_large_records(text))
 
@@ -315,14 +523,14 @@ def terminal_suffix_is_idle(suffix: str) -> bool:
     """Return whether no later submitted prompt or Codex output is visible."""
 
     if re.search(
-        r"^›[ \t]+(?:Continue|/compact)[ \t]*$",
+        r"^[›»][ \t]+(?:Continue|/compact|/goal resume)[ \t]*$",
         suffix,
         re.MULTILINE,
     ):
         return False
     if re.search(r"^(?:•|■|ⓘ|└|│)[ \t]", suffix, re.MULTILINE):
         return False
-    if len(re.findall(r"^›[ \t].*$", suffix, re.MULTILINE)) > 1:
+    if len(re.findall(r"^[›»][ \t].*$", suffix, re.MULTILINE)) > 1:
         return False
     return True
 
@@ -331,7 +539,30 @@ def composer_has_visible_input(text: str) -> bool:
     """Return whether the bottom composer visibly contains user text."""
 
     lines = text.rstrip("\n").splitlines()
-    return bool(lines and re.match(r"^›[ \t]+\S", lines[-1]))
+    return bool(lines and re.match(r"^[›»][ \t]+\S", lines[-1]))
+
+
+def goal_footer_status_match(text: str, start: int = 0) -> re.Match[str] | None:
+    """Return a strict current-footer Goal status after the composer row.
+
+    Codex can render rotating suggestions such as ``Summarize recent commits``
+    in an empty composer. Plain capture text cannot distinguish that hint from
+    typed text, so submission still requires both independent cursor checks.
+    """
+
+    composers = list(EMPTY_COMPOSER_RE.finditer(text, start))
+    if not composers:
+        return None
+    composer = composers[-1]
+    footer_matches = list(GOAL_FOOTER_STATUS_RE.finditer(text, composer.end()))
+    if not footer_matches:
+        return None
+    footer = footer_matches[-1]
+    if text[composer.end() : footer.start()].strip():
+        return None
+    if text[footer.end() :].strip():
+        return None
+    return footer
 
 
 def terminal_event_is_current_text(
@@ -376,7 +607,16 @@ def terminal_event_is_current_text(
         return False
 
     _, end, _ = records[-1]
-    if not terminal_suffix_is_idle(validation_text[end:]):
+    suffix = validation_text[end:]
+    if event == RATE_LIMIT:
+        # A failed goal turn renders this informational status cell after the
+        # error. It does not represent a newer turn or user input. Keep the
+        # exception strict and scoped only to the 429 recovery path.
+        suffix = GOAL_STATUS_RE.sub("", suffix)
+        footer = goal_footer_status_match(suffix)
+        if footer is not None:
+            suffix = suffix[: footer.start()] + suffix[footer.end() :]
+    if not terminal_suffix_is_idle(suffix):
         return False
 
     if event == WORKED_INTERRUPTED:
@@ -502,20 +742,57 @@ def process_children(pid: int) -> set[int]:
     return children
 
 
+def is_installed_codex_path(path: str) -> bool:
+    """Accept current and npm-retained Codex native package paths."""
+
+    deleted = path.endswith(" (deleted)")
+    executable = Path(path.removesuffix(" (deleted)"))
+    parts = executable.parts
+    if executable.name != "codex" or not executable.is_absolute():
+        return False
+
+    for index in range(len(parts) - 5):
+        if (
+            parts[index : index + 3] == ("node_modules", "@openai", "codex")
+            and parts[index + 3 : index + 5]
+            == ("node_modules", "@openai")
+            and parts[index + 5 :] in CODEX_NATIVE_PACKAGE_TAILS
+        ):
+            return True
+
+    if not deleted:
+        return False
+    for index, component in enumerate(parts):
+        retired = re.fullmatch(r"\.codex-([A-Za-z0-9]{8})", component)
+        if (
+            retired is None
+            or index < 2
+            or parts[index - 2 : index] != ("node_modules", "@openai")
+        ):
+            continue
+        if (
+            len(parts) <= index + 3
+            or parts[index + 1 : index + 3] != ("node_modules", "@openai")
+            or parts[index + 3 :] not in CODEX_NATIVE_PACKAGE_TAILS
+        ):
+            continue
+        original = str(Path(*parts[:index]) / "codex")
+        digest = base64.b64encode(
+            hashlib.sha1(original.encode()).digest()
+        ).decode()
+        expected = re.sub(r"[^A-Za-z0-9]+", "", digest)[:8]
+        if retired.group(1) == expected:
+            return True
+    return False
+
+
 def installed_codex_executable(pid: int) -> Path | None:
     try:
         target = os.readlink(f"/proc/{pid}/exe")
     except (FileNotFoundError, PermissionError, ProcessLookupError):
         return None
     executable = Path(target.removesuffix(" (deleted)"))
-    path = str(executable)
-    package_marker = f"{os.sep}@openai{os.sep}codex{os.sep}"
-    vendor_marker = f"{os.sep}vendor{os.sep}"
-    if (
-        executable.name == "codex"
-        and package_marker in path
-        and vendor_marker in path
-    ):
+    if is_installed_codex_path(target):
         return executable
     return None
 
@@ -653,6 +930,76 @@ def pane_cursor_x(socket: str, pane: str) -> int | None:
         return None
 
 
+def pane_cursor_position(socket: str, pane: str) -> tuple[int, int] | None:
+    """Return the live cursor cell only while the pane is outside a mode."""
+
+    result = run_tmux(
+        socket,
+        "display-message",
+        "-p",
+        "-t",
+        pane,
+        "#{cursor_x}|#{cursor_y}|#{pane_in_mode}",
+    )
+    if result.returncode != 0:
+        return None
+    parts = result.stdout.strip().split("|", 2)
+    if len(parts) != 3 or parts[2] != "0":
+        return None
+    try:
+        return int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+
+
+def composer_is_empty(cursor_x: int | None) -> bool:
+    """Return whether tmux confirms the composer is still at its empty cell."""
+
+    return cursor_x == EMPTY_COMPOSER_CURSOR_X
+
+
+def styled_composer_is_empty(text: str, cursor_y: int) -> bool:
+    """Accept only the cursor row's empty composer or dim placeholder."""
+
+    lines = text.splitlines()
+    if cursor_y < 0 or cursor_y >= len(lines):
+        return False
+    line = lines[cursor_y]
+    cells: list[tuple[str, bool]] = []
+    dim = False
+    offset = 0
+    for escape in ANSI_CSI_RE.finditer(line):
+        cells.extend(
+            (character, dim) for character in line[offset : escape.start()]
+        )
+        sequence = escape.group()
+        if sequence.endswith("m"):
+            parameters = sequence[2:-1].replace(":", ";").split(";")
+            try:
+                codes = [int(value) if value else 0 for value in parameters]
+            except ValueError:
+                codes = []
+            for code in codes:
+                if code in {0, 22}:
+                    dim = False
+                elif code == 2:
+                    dim = True
+        offset = escape.end()
+    cells.extend((character, dim) for character in line[offset:])
+
+    plain = "".join(character for character, _dim in cells)
+    composer = EMPTY_COMPOSER_RE.fullmatch(plain)
+    if composer is None:
+        return False
+    prompt_index = composer.start("prompt")
+    content = [
+        is_dim
+        for character, is_dim in cells[prompt_index + 1 :]
+        if not character.isspace()
+    ]
+    return not content or all(content)
+
+
 def capture_event_text(socket: str, pane: str) -> str | None:
     result = run_tmux(
         socket,
@@ -669,13 +1016,6 @@ def capture_event_text(socket: str, pane: str) -> str | None:
     return result.stdout
 
 
-def capture_events(socket: str, pane: str) -> list[str] | None:
-    text = capture_event_text(socket, pane)
-    if text is None:
-        return None
-    return event_signatures(text)
-
-
 def capture_visible_text(socket: str, pane: str) -> str | None:
     result = run_tmux(socket, "capture-pane", "-p", "-J", "-t", pane)
     if result.returncode != 0:
@@ -683,15 +1023,23 @@ def capture_visible_text(socket: str, pane: str) -> str | None:
     return result.stdout
 
 
+def capture_visible_styled_text(socket: str, pane: str) -> str | None:
+    # Do not use -J here: physical rows must stay aligned with #{cursor_y}.
+    result = run_tmux(socket, "capture-pane", "-e", "-p", "-t", pane)
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
 def current_terminal_events(
     socket: str, pane: str, events: list[str] | set[str]
-) -> list[str]:
+) -> list[str] | None:
     text = capture_visible_text(socket, pane)
     if text is None:
-        return []
+        return None
     context_text = capture_event_text(socket, pane)
     if context_text is None:
-        return []
+        return None
     return [
         event
         for event in events
@@ -703,6 +1051,59 @@ def current_terminal_events(
     ]
 
 
+def goal_status_reply(status: str) -> str:
+    if status in GOAL_RESUMABLE_STATUSES:
+        return "/goal resume"
+    return REPLY
+
+
+def goal_footer_reply(status: str) -> str:
+    if status.startswith(
+        (
+            "Pursuing goal",
+            "Goal paused",
+            "Goal stalled",
+            "Goal hit usage limits",
+        )
+    ):
+        return "/goal resume"
+    return REPLY
+
+
+def goal_resume_reply(text: str) -> str:
+    """Choose the 429 command from the current event's strict Goal trailer.
+
+    A current recoverable Goal uses ``/goal resume``. Every other 429 uses
+    ``Continue`` because the error itself proves the ordinary turn stopped
+    abnormally; terminal Goal labels only mean that Goal must not be resumed.
+    """
+
+    rate_limits = list(RATE_LIMIT_RE.finditer(text))
+    if not rate_limits:
+        return REPLY
+    start = rate_limits[-1].end()
+    statuses: list[tuple[int, str]] = []
+    statuses.extend(
+        (
+            match.start(),
+            goal_status_reply(match.group("status")),
+        )
+        for match in GOAL_STATUS_RE.finditer(text, start)
+    )
+    footer = goal_footer_status_match(text, start)
+    if footer is not None:
+        footer_status = footer.group("status")
+        statuses.append(
+            (
+                footer.start(),
+                goal_footer_reply(footer_status),
+            )
+        )
+    if not statuses:
+        return REPLY
+    return sorted(statuses)[-1][1]
+
+
 def capture_safety_menu_selection(socket: str, pane: str) -> str | None:
     """Inspect only the visible grid so stale scrollback cannot trigger keys."""
 
@@ -712,10 +1113,18 @@ def capture_safety_menu_selection(socket: str, pane: str) -> str | None:
     return safety_menu_selection(text)
 
 
-def tmux_option_enabled(socket: str, option_name: str) -> bool:
+def tmux_option_state(socket: str, option_name: str) -> bool | None:
+    """Return an option's truth value, or None when tmux is unavailable."""
+
     result = run_tmux(socket, "show-options", "-gqv", option_name)
+    if result.returncode != 0:
+        return None
     value = result.stdout.strip().lower()
-    return result.returncode == 0 and value in {"1", "on", "true", "yes"}
+    return value in {"1", "on", "true", "yes"}
+
+
+def tmux_option_enabled(socket: str, option_name: str) -> bool:
+    return tmux_option_state(socket, option_name) is True
 
 
 def option_enabled(socket: str) -> bool:
@@ -735,6 +1144,62 @@ def clear_compaction_wait(state: PaneState) -> None:
     state.context_retry_seen = False
     state.context_compaction_started = 0.0
     state.deferred_events.pop(CONTEXT_COMPACTED, None)
+
+
+def observe_rate_limit_events(
+    state: PaneState,
+    events: list[str],
+    now: float,
+) -> float | None:
+    """Record newly rendered 429s and return the fixed recovery delay."""
+
+    latest_delay: float | None = None
+    for event in events:
+        if event == RATE_LIMIT:
+            if (
+                state.rate_limit_last_seen
+                and now - state.rate_limit_last_seen
+                > RATE_LIMIT_RETRY_RESET_SECONDS
+            ):
+                state.rate_limit_attempts = 0
+            delay_index = min(
+                state.rate_limit_attempts,
+                len(RATE_LIMIT_RETRY_DELAYS_SECONDS) - 1,
+            )
+            latest_delay = RATE_LIMIT_RETRY_DELAYS_SECONDS[delay_index]
+            state.rate_limit_attempts += 1
+            state.rate_limit_last_seen = now
+            state.rate_limit_retry_after = max(
+                state.rate_limit_retry_after,
+                now + latest_delay,
+            )
+        else:
+            clear_rate_limit_backoff(state)
+    return latest_delay
+
+
+def clear_rate_limit_backoff(state: PaneState) -> None:
+    state.rate_limit_attempts = 0
+    state.rate_limit_last_seen = 0.0
+    state.rate_limit_retry_after = 0.0
+
+
+def reconcile_rate_limit_terminal(
+    state: PaneState,
+    new_events: list[str],
+    current: bool,
+) -> None:
+    """Use a current-terminal transition when signature overlap is ambiguous."""
+
+    if RATE_LIMIT in new_events:
+        state.rate_limit_terminal_latched = True
+        return
+    if not current:
+        state.rate_limit_terminal_latched = False
+        return
+    if not state.rate_limit_terminal_latched:
+        new_events.append(RATE_LIMIT)
+    state.rate_limit_terminal_latched = True
 
 
 def reply_for_events(events: list[str]) -> str:
@@ -758,6 +1223,8 @@ def schedule_pending(
         now + SETTLE_SECONDS,
         state.last_sent + MIN_SEND_GAP_SECONDS,
     )
+    if RATE_LIMIT in events:
+        state.send_after = max(state.send_after, state.rate_limit_retry_after)
 
 
 def defer_events(
@@ -781,7 +1248,8 @@ def expire_deferred_events(
     state: PaneState, now: float, pane: str, session: str
 ) -> None:
     for event, seen_at in list(state.deferred_events.items()):
-        if now - seen_at <= DEFERRED_EVENT_TTL_SECONDS:
+        expires_at = seen_at + DEFERRED_EVENT_TTL_SECONDS
+        if now <= expires_at:
             continue
         del state.deferred_events[event]
         state.pending_events.discard(event)
@@ -818,7 +1286,7 @@ def submit_text(
     process_identity: str,
     expected_events: set[str],
     reply: str,
-) -> bool:
+) -> SubmitResult:
     """Paste text explicitly, then submit it with a real Enter key.
 
     Codex treats a rapid sequence of ordinary character key events as a paste
@@ -828,28 +1296,28 @@ def submit_text(
     three tmux commands are queued together server-side to preserve ordering.
     """
 
-    if pane_cursor_x(socket, pane) != EMPTY_COMPOSER_CURSOR_X:
+    if not composer_is_empty(pane_cursor_x(socket, pane)):
         log(f"skipped pane {pane}: composer is not empty or not ready")
-        return False
+        return SubmitResult()
 
     buffer_name = f"codex-auto-continue-{os.getpid()}-{pane.lstrip('%')}"
     if codex_process_identity(pane_pid) != process_identity:
         log(f"skipped pane {pane}: Codex foreground process changed")
-        return False
+        return SubmitResult()
     if pane_is_in_mode(socket, pane) or not option_enabled(socket):
         log(f"skipped pane {pane}: pane mode or option changed")
-        return False
+        return SubmitResult()
     visible_text = capture_visible_text(socket, pane)
     if visible_text is None:
         log(f"skipped pane {pane}: pane viewport is unavailable")
-        return False
+        return SubmitResult(preserve_pending=True)
     if safety_menu_selection(visible_text) is not None:
         log(f"skipped pane {pane}: safety menu owns the keyboard")
-        return False
+        return SubmitResult()
     context_text = capture_event_text(socket, pane)
     if context_text is None:
         log(f"skipped pane {pane}: pane history is unavailable")
-        return False
+        return SubmitResult(preserve_pending=True)
     if not any(
         terminal_event_is_current_text(
             visible_text,
@@ -859,7 +1327,29 @@ def submit_text(
         for event in expected_events
     ):
         log(f"skipped pane {pane}: terminal event is no longer current")
-        return False
+        return SubmitResult()
+
+    if RATE_LIMIT in expected_events:
+        reply = goal_resume_reply(visible_text)
+
+    cursor_position = pane_cursor_position(socket, pane)
+    if cursor_position is None or cursor_position[0] != EMPTY_COMPOSER_CURSOR_X:
+        log(f"skipped pane {pane}: composer changed before styled capture")
+        return SubmitResult()
+    styled_text = capture_visible_styled_text(socket, pane)
+    if styled_text is None:
+        log(f"skipped pane {pane}: styled pane viewport is unavailable")
+        return SubmitResult(preserve_pending=True)
+    if not styled_composer_is_empty(styled_text, cursor_position[1]):
+        log(f"skipped pane {pane}: composer contains user input")
+        return SubmitResult()
+
+    # A user can begin typing after the first composer check while the event
+    # and Goal state are being revalidated. Check again immediately before
+    # queuing paste plus Enter so their input is never overwritten or sent.
+    if pane_cursor_position(socket, pane) != cursor_position:
+        log(f"skipped pane {pane}: composer changed before submission")
+        return SubmitResult()
 
     submitted = run_tmux(
         socket,
@@ -884,8 +1374,8 @@ def submit_text(
     )
     if submitted.returncode != 0:
         log(f"failed to submit reply to pane {pane}: {submitted.stderr.strip()}")
-        return False
-    return True
+        return SubmitResult()
+    return SubmitResult(reply=reply)
 
 
 def choose_keep_waiting(
@@ -992,8 +1482,16 @@ def start_daemon(socket: str) -> bool:
     script = str(Path(__file__).resolve())
     log_path = Path.home() / ".cache/tmux-codex-auto-continue.log"
     log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    resolved_tmux = tmux_command(socket).executable
+    tmux_override = ""
+    if Path(resolved_tmux).is_absolute():
+        tmux_override = (
+            "TMUX_CODEX_AUTO_CONTINUE_TMUX="
+            f"{shlex.quote(resolved_tmux)} "
+        )
     command = (
-        f"umask 077; {shlex.quote(sys.executable)} {shlex.quote(script)} "
+        f"umask 077; {tmux_override}{shlex.quote(sys.executable)} "
+        f"{shlex.quote(script)} "
         f"--socket {shlex.quote(socket)} >> {shlex.quote(str(log_path))} 2>&1"
     )
     result = run_tmux(socket, "run-shell", "-b", command)
@@ -1008,6 +1506,7 @@ def run_daemon(socket: str) -> int:
     # Keep the descriptor alive for the lifetime of the daemon.
     _ = lock_descriptor
     states: dict[str, PaneState] = {}
+    initial_scan = True
     log(f"watching tmux server {socket}")
 
     while True:
@@ -1027,19 +1526,49 @@ def run_daemon(socket: str) -> int:
                 states.pop(pane, None)
                 continue
 
-            events = capture_events(socket, pane)
-            if events is None:
+            context_text = capture_event_text(socket, pane)
+            visible_text = capture_visible_text(socket, pane)
+            if context_text is None or visible_text is None:
                 states.pop(pane, None)
                 continue
+            events = event_signatures(context_text)
+            rate_limit_current = (
+                RATE_LIMIT in events
+                and terminal_event_is_current_text(
+                    visible_text,
+                    RATE_LIMIT,
+                    context_text=context_text,
+                )
+            )
 
             state = states.get(pane)
             if state is None or state.process_identity != process_identity:
-                states[pane] = PaneState(process_identity, events, geometry)
+                states[pane] = PaneState(
+                    process_identity,
+                    events,
+                    geometry,
+                    rate_limit_terminal_latched=rate_limit_current,
+                )
                 log(f"baselined Codex pane {pane} in session {session}")
-                continue
+                if initial_scan:
+                    continue
+                state = states[pane]
+                new_events = [
+                    event
+                    for event in dict.fromkeys(events)
+                    if terminal_event_is_current_text(
+                        visible_text,
+                        event,
+                        context_text=context_text,
+                    )
+                ]
+                if not new_events:
+                    continue
+            else:
+                new_events = appended_events(state.events, events)
 
             if state.geometry != geometry:
-                resized_events = appended_events(state.events, events)
+                resized_events = new_events
                 if (
                     state.awaiting_context_compacted
                     and CONTEXT_COMPACTED in resized_events
@@ -1048,15 +1577,27 @@ def run_daemon(socket: str) -> int:
                     state.context_compaction_started = now
                 state.events = events
                 state.geometry = geometry
+                state.rate_limit_terminal_latched = rate_limit_current
                 clear_pending(state)
+                clear_rate_limit_backoff(state)
                 state.deferred_events.clear()
                 log(f"rebaselined resized Codex pane {pane} in session {session}")
                 continue
 
-            new_events = appended_events(state.events, events)
             state.events = events
+            reconcile_rate_limit_terminal(
+                state,
+                new_events,
+                rate_limit_current,
+            )
+            rate_limit_delay = observe_rate_limit_events(state, new_events, now)
+            if rate_limit_delay is not None:
+                log(
+                    f"delaying rate-limit recovery for pane {pane} "
+                    f"({session}) by {rate_limit_delay:.0f}s"
+                )
 
-            menu_selection = capture_safety_menu_selection(socket, pane)
+            menu_selection = safety_menu_selection(visible_text)
             if menu_selection is None:
                 state.safety_menu_absent_polls += 1
                 if state.safety_menu_absent_polls >= 2:
@@ -1088,6 +1629,7 @@ def run_daemon(socket: str) -> int:
                     state.safety_menu_latched = True
                 clear_pending(state)
                 clear_compaction_wait(state)
+                clear_rate_limit_backoff(state)
                 state.deferred_events.clear()
                 continue
 
@@ -1172,6 +1714,7 @@ def run_daemon(socket: str) -> int:
                 if menu_selection is not None:
                     state.safety_menu_latched = True
                     clear_compaction_wait(state)
+                    clear_rate_limit_backoff(state)
                     state.deferred_events.clear()
                 clear_pending(state)
                 continue
@@ -1181,6 +1724,7 @@ def run_daemon(socket: str) -> int:
                 # to composer-oriented error recovery while it is visible.
                 clear_pending(state)
                 clear_compaction_wait(state)
+                clear_rate_limit_backoff(state)
                 state.deferred_events.clear()
                 if (
                     menu_selection in {"retry", "wait"}
@@ -1329,6 +1873,7 @@ def run_daemon(socket: str) -> int:
             if not option_enabled(socket):
                 clear_pending(state)
                 clear_compaction_wait(state)
+                clear_rate_limit_backoff(state)
                 state.deferred_events.clear()
                 continue
             current_events = current_terminal_events(
@@ -1336,6 +1881,12 @@ def run_daemon(socket: str) -> int:
                 pane,
                 state.pending_events,
             )
+            if current_events is None:
+                log(
+                    f"preserved pending recovery for pane {pane} "
+                    f"({session}); terminal capture is unavailable"
+                )
+                continue
             if not current_events:
                 if (
                     state.awaiting_context_compacted
@@ -1343,6 +1894,8 @@ def run_daemon(socket: str) -> int:
                 ):
                     clear_compaction_wait(state)
                     state.deferred_events.clear()
+                if RATE_LIMIT in state.pending_events:
+                    clear_rate_limit_backoff(state)
                 clear_pending(state)
                 continue
             state.pending_events.intersection_update(current_events)
@@ -1386,7 +1939,11 @@ def run_daemon(socket: str) -> int:
                     )
                     defer_events(
                         state,
-                        current_events,
+                        (
+                            current_events
+                            if current_events is not None
+                            else list(state.pending_events)
+                        ),
                         now,
                         pane,
                         session,
@@ -1401,16 +1958,17 @@ def run_daemon(socket: str) -> int:
             reply = state.pending_reply or REPLY
             pending_deferred = set(state.pending_deferred_events)
             pending_events = set(state.pending_events)
-            if submit_text(
+            result = submit_text(
                 socket,
                 pane,
                 pane_pid,
                 process_identity,
                 state.pending_events,
                 reply,
-            ):
+            )
+            if result.reply is not None:
                 state.last_sent = time.monotonic()
-                if reply == COMPACT_COMMAND:
+                if result.reply == COMPACT_COMMAND:
                     clear_compaction_wait(state)
                     state.awaiting_context_compacted = True
                     state.context_compaction_started = state.last_sent
@@ -1420,7 +1978,7 @@ def run_daemon(socket: str) -> int:
                     )
                 else:
                     log(
-                        f"sent Continue to pane {pane} ({session}); "
+                        f"sent {result.reply} to pane {pane} ({session}); "
                         f"event={kinds}"
                     )
                     if (
@@ -1433,11 +1991,14 @@ def run_daemon(socket: str) -> int:
                         clear_compaction_wait(state)
                 if pending_deferred:
                     state.deferred_events.clear()
+            elif result.preserve_pending:
+                continue
             clear_pending(state)
 
         for pane in set(states) - seen_panes:
             states.pop(pane, None)
 
+        initial_scan = False
         time.sleep(POLL_INTERVAL_SECONDS)
 
 
@@ -1460,6 +2021,11 @@ def toggle(socket: str) -> int:
 
 def restart_daemon(socket: str) -> int:
     """Replace only this socket's verified watcher process."""
+
+    enabled = tmux_option_state(socket, OPTION_NAME)
+    if enabled is None:
+        print("failed to query tmux auto-continue option", file=sys.stderr)
+        return 1
 
     previous_pid = daemon_pid(socket)
     if previous_pid is not None:
@@ -1484,7 +2050,7 @@ def restart_daemon(socket: str) -> int:
             )
             return 1
 
-    if not option_enabled(socket):
+    if not enabled:
         return 0
     if not start_daemon(socket):
         print("failed to restart auto-continue watcher", file=sys.stderr)
@@ -1518,11 +2084,102 @@ def show_status(socket: str) -> int:
 
 
 def self_test() -> int:
+    assert tmux_server_pid_from_environment(
+        "/tmp/tmux-1000/default", "/tmp/tmux-1000/default,6252,38"
+    ) == 6252
+    assert tmux_server_pid_from_environment(
+        "/tmp/tmux,socket", "/tmp/tmux,socket,6252,0"
+    ) == 6252
+    assert tmux_server_pid_from_environment(
+        "/tmp/tmux-1000/other", "/tmp/tmux-1000/default,6252,38"
+    ) is None
+    assert tmux_server_pid_from_environment(
+        "/tmp/tmux-1000/default", "/tmp/tmux-1000/default,invalid,38"
+    ) is None
+    assert tmux_server_pid_from_environment(
+        "/tmp/tmux-1000/default", "/tmp/tmux-1000/default,0,38"
+    ) is None
+    assert is_installed_codex_path(
+        "/home/user/.npm/lib/node_modules/@openai/codex/node_modules/"
+        "@openai/codex-linux-arm64/vendor/aarch64-unknown-linux-musl/"
+        "bin/codex"
+    )
+    assert is_installed_codex_path(
+        "/home/user/.npm/lib/node_modules/@openai/codex/node_modules/"
+        "@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex"
+    )
+    retired_parent = "/home/user/.npm/lib/node_modules/@openai/codex"
+    retired_digest = base64.b64encode(
+        hashlib.sha1(retired_parent.encode()).digest()
+    ).decode()
+    retired_suffix = re.sub(r"[^A-Za-z0-9]+", "", retired_digest)[:8]
+    retired_path = (
+        "/home/user/.npm/lib/node_modules/@openai/.codex-"
+        f"{retired_suffix}/node_modules/@openai/codex-linux-arm64/"
+        "vendor/aarch64-unknown-linux-musl/bin/codex"
+    )
+    assert is_installed_codex_path(f"{retired_path} (deleted)")
+    assert not is_installed_codex_path(retired_path)
+    assert not is_installed_codex_path(
+        retired_path.replace(retired_suffix, "12345678") + " (deleted)"
+    )
+    assert not is_installed_codex_path(
+        "/tmp/@openai/not-codex/vendor/aarch64/bin/codex"
+    )
+    assert not is_installed_codex_path(
+        "/home/user/.npm/lib/node_modules/@openai/.codex-/vendor/bin/codex"
+    )
+    assert not is_installed_codex_path(
+        "/home/user/.npm/lib/node_modules/@openai/.codex-old/bin/codex"
+    )
+    assert not is_installed_codex_path(
+        "/tmp/node_modules/@openai/codex/node_modules/@openai/"
+        "codex-linux-malware/not-real/vendor/arbitrary/codex"
+    )
+    assert not is_installed_codex_path(
+        "/tmp/node_modules/@openai/codex/node_modules/@openai/"
+        "codex-linux-arm64/vendor/aarch64/bin/codex"
+    )
     assert not tmux_mode_active("0")
     assert tmux_mode_active("1")
     assert tmux_mode_active("2")
     assert tmux_mode_active("")
     assert tmux_mode_active("unexpected")
+    assert composer_is_empty(EMPTY_COMPOSER_CURSOR_X)
+    assert not composer_is_empty(EMPTY_COMPOSER_CURSOR_X + 1)
+    assert not composer_is_empty(None)
+    styled_dynamic_hint = (
+        "\x1b[1m\x1b[38;5;5m»\x1b[0m\x1b[39m\x1b[49m "
+        "\x1b[2mSummarize recent commits\x1b[0m\x1b[39m\x1b[49m\n"
+        "  Goal stalled (/goal resume)"
+    )
+    assert styled_composer_is_empty(styled_dynamic_hint, 0)
+    assert styled_composer_is_empty("\x1b[1m›\x1b[0m", 0)
+    assert styled_composer_is_empty(
+        "\x1b[1m»\x1b[0m \x1b[2mUse › to continue\x1b[0m",
+        0,
+    )
+    assert not styled_composer_is_empty("» Summarize recent commits", 0)
+    assert not styled_composer_is_empty(
+        "\x1b[1m»\x1b[0m user › \x1b[2mhint\x1b[0m",
+        0,
+    )
+    assert not styled_composer_is_empty(
+        "\x1b[1m›\x1b[0m \x1b[2mplaceholder\x1b[22m user-text",
+        0,
+    )
+    assert not styled_composer_is_empty(
+        "\x1b[1m›\x1b[0m\n  multiline user text",
+        1,
+    )
+    assert not styled_composer_is_empty(
+        "\x1b[1m›\x1b[0m \x1b[2;22muser-text",
+        0,
+    )
+    assert styled_composer_is_empty(
+        "\x1b[1m›\x1b[0m \x1b[22;2mplaceholder",
+        0,
+    )
 
     retry_sample = "\n".join(
         [
@@ -1552,6 +2209,7 @@ def self_test() -> int:
                 "Please include the request ID "
                 "30f0c0fa-d1dc-4c5f-8c63-f2909d6f0fc3 in your message."
             ),
+            "■ exceeded retry limit, last status: 429 Too Many Requests",
             (
                 "› quoted: 1. ─ Worked for 15m 36s ────── 2. ■ An error "
                 "occurred while processing your request. ■ internal streaming "
@@ -1589,6 +2247,7 @@ def self_test() -> int:
         "server_overloaded",
         "server_overloaded",
         "error:30f0c0fa-d1dc-4c5f-8c63-f2909d6f0fc3",
+        "rate_limit",
         "capacity",
         "cyber_content_blocked",
         "cyber_risk_flagged",
@@ -1720,6 +2379,135 @@ def self_test() -> int:
         f"  {remote_error}",
     ):
         assert event_signatures(quoted_remote_event) == []
+    rate_limit = "■ exceeded retry limit, last status: 429 Too Many Requests"
+    assert event_signatures(rate_limit) == [RATE_LIMIT]
+    assert event_signatures(f"{rate_limit}  ---   ") == [RATE_LIMIT]
+    for quoted_rate_limit in (
+        rate_limit.removeprefix("■ "),
+        f"› {rate_limit}",
+        f"  {rate_limit}",
+        rate_limit.replace("429", "500", 1),
+        rate_limit.replace("Too Many Requests", "Request Timeout", 1),
+    ):
+        assert event_signatures(quoted_rate_limit) == []
+    goal_active = (
+        "• Goal active Objective: 现在做的就是goal Time: 58m."
+    )
+    current_rate_limit = f"{rate_limit}\n\n{goal_active}\n\n› "
+    assert terminal_event_is_current_text(current_rate_limit, RATE_LIMIT)
+    assert goal_resume_reply(current_rate_limit) == "/goal resume"
+    for status in ("paused", "stalled", "blocked", "usage limited"):
+        goal = f"• Goal {status} Objective: recover this goal Time: 58m."
+        assert goal_resume_reply(f"{rate_limit}\n\n{goal}\n\n› ") == "/goal resume"
+    for status in (
+        "limited by budget",
+        "budget limited",
+        "achieved",
+        "unmet",
+        "abandoned",
+    ):
+        goal = f"• Goal {status} Objective: finished goal Time: 58m."
+        current = f"{rate_limit}\n\n{goal}\n\n› "
+        assert terminal_event_is_current_text(current, RATE_LIMIT)
+        assert goal_resume_reply(current) == REPLY
+    completed_goal = (
+        "• Goal complete Objective: finished goal Time: 58m."
+    )
+    assert goal_resume_reply(
+        f"{rate_limit}\n\n{completed_goal}\n\n› "
+    ) == REPLY
+    assert goal_resume_reply(f"{rate_limit}\n\n› ") == REPLY
+    assert goal_resume_reply(f"{goal_active}\n\n{rate_limit}\n\n› ") == REPLY
+    assert goal_resume_reply(
+        f"{rate_limit}\n\n{goal_active}\n\n"
+        f"{rate_limit}\n\n› "
+    ) == REPLY
+    assert goal_resume_reply(
+        f"{rate_limit}\n\n• Goal complete Objective: old goal Time: 58m.\n\n"
+        f"{rate_limit}\n\n{goal_active}\n\n› "
+    ) == "/goal resume"
+    assert goal_resume_reply(
+        f"{rate_limit}\n\n• Goal active Objective: hourly goal Time: 2h.\n\n› "
+    ) == "/goal resume"
+    for status in (
+        "• Goal active Objective: zero-time goal",
+        "• Goal active Objective: token goal Tokens: 63.9K/50K.",
+        "• Goal active Objective: day goal Time: 1d 2h 3m.",
+        "• Goal active Objective: tracked goal Time: 2h 3m. Tokens: 40K/50K.",
+    ):
+        current = f"{rate_limit}\n\n{status}\n\n› "
+        assert terminal_event_is_current_text(current, RATE_LIMIT)
+        assert goal_resume_reply(current) == "/goal resume"
+    footer_active = "  gpt-5.4                  Pursuing goal (40K / 50K)"
+    footer_stalled = "  gpt-5.6-sol default      Goal stalled (/goal resume) · IDE context"
+    footer_terminal = "  Goal achieved"
+    for footer in (footer_active, footer_stalled):
+        current = f"{rate_limit}\n\n› Ask Codex to do anything\n{footer}\n"
+        assert terminal_event_is_current_text(current, RATE_LIMIT)
+        assert goal_resume_reply(current) == "/goal resume"
+    terminal_footer_current = (
+        f"{rate_limit}\n\n[NORMAL] › Ask Codex to do anything\n"
+        f"{footer_terminal}\n"
+    )
+    assert terminal_event_is_current_text(terminal_footer_current, RATE_LIMIT)
+    assert goal_resume_reply(terminal_footer_current) == REPLY
+    ultra_footer_current = (
+        f"{rate_limit}\n\n» Ask Codex to do anything\n{footer_stalled}\n"
+    )
+    assert terminal_event_is_current_text(ultra_footer_current, RATE_LIMIT)
+    assert goal_resume_reply(ultra_footer_current) == "/goal resume"
+    dynamic_hint_footer_current = (
+        f"{rate_limit}\n\n» Summarize recent commits\n{footer_stalled}\n"
+    )
+    assert terminal_event_is_current_text(
+        dynamic_hint_footer_current,
+        RATE_LIMIT,
+    )
+    assert goal_resume_reply(dynamic_hint_footer_current) == "/goal resume"
+    ultra_terminal_current = (
+        f"{rate_limit}\n\n» Ask Codex to do anything\n{footer_terminal}\n"
+    )
+    assert goal_resume_reply(ultra_terminal_current) == REPLY
+    for terminal_footer in (
+        "  Goal unmet (63.9K / 50K tokens)",
+        "  Goal abandoned",
+    ):
+        assert goal_resume_reply(
+            f"{rate_limit}\n\n» Ask Codex to do anything\n"
+            f"{terminal_footer}\n"
+        ) == REPLY
+    assert goal_resume_reply(
+        f"{footer_active}\n\n{rate_limit}\n\n› "
+    ) == REPLY
+    assert goal_resume_reply(
+        f"{rate_limit}\n\n› Ask Codex to do anything\n"
+        "Goal stalled (/goal resume)\n"
+    ) == REPLY
+    assert goal_resume_reply(
+        f"{rate_limit}\n\n{footer_stalled}\n\n› Ask Codex to do anything"
+    ) == REPLY
+    assert not terminal_event_is_current_text(
+        f"{rate_limit}\n\n› Ask Codex to do anything\n{footer_stalled}\n"
+        "› /goal resume",
+        RATE_LIMIT,
+    )
+    assert not terminal_event_is_current_text(
+        f"{rate_limit}\n\n» Ask Codex to do anything\n{footer_stalled}\n"
+        "» /goal resume",
+        RATE_LIMIT,
+    )
+    assert terminal_event_is_current_text(
+        current_rate_limit.replace("Goal active", "Goal paused"),
+        RATE_LIMIT,
+    )
+    assert not terminal_event_is_current_text(
+        f"{rate_limit}\n\n• Goal unknown Objective: malformed Time: 58m\n\n› ",
+        RATE_LIMIT,
+    )
+    assert not terminal_event_is_current_text(
+        f"{current_rate_limit}\n• Ran a newer action",
+        RATE_LIMIT,
+    )
     capacity = "Selected model is at capacity. Please try a different model."
     assert event_signatures(f"⚠ {capacity}") == ["capacity"]
     assert event_signatures(f"⚠ {capacity}\n⚠ {capacity}") == [
@@ -2003,6 +2791,73 @@ def self_test() -> int:
         [first_error],
         [first_error, second_error],
     ) == [second_error]
+
+    rate_state = PaneState("test-process", [], (80, 24))
+    assert appended_events([RATE_LIMIT], [RATE_LIMIT]) == []
+    assert appended_events(
+        [RATE_LIMIT],
+        [RATE_LIMIT, RATE_LIMIT],
+    ) == [RATE_LIMIT]
+    latched_rate_state = PaneState(
+        "test-process",
+        [RATE_LIMIT],
+        (80, 24),
+        rate_limit_terminal_latched=True,
+    )
+    latched_events: list[str] = []
+    reconcile_rate_limit_terminal(latched_rate_state, latched_events, True)
+    assert latched_events == []
+    reconcile_rate_limit_terminal(latched_rate_state, latched_events, False)
+    assert not latched_rate_state.rate_limit_terminal_latched
+    reconcile_rate_limit_terminal(latched_rate_state, latched_events, True)
+    assert latched_events == [RATE_LIMIT]
+    reconcile_rate_limit_terminal(latched_rate_state, latched_events, True)
+    assert latched_events == [RATE_LIMIT]
+    progressive_rate_state = PaneState("test-process", [], (80, 24))
+    progressive_events = [RATE_LIMIT]
+    reconcile_rate_limit_terminal(
+        progressive_rate_state,
+        progressive_events,
+        False,
+    )
+    assert progressive_rate_state.rate_limit_terminal_latched
+    next_progressive_events: list[str] = []
+    reconcile_rate_limit_terminal(
+        progressive_rate_state,
+        next_progressive_events,
+        True,
+    )
+    assert next_progressive_events == []
+    assert observe_rate_limit_events(rate_state, [RATE_LIMIT], 100.0) == 2.0
+    assert rate_state.rate_limit_retry_after == 102.0
+    assert observe_rate_limit_events(rate_state, [RATE_LIMIT], 103.0) == 2.0
+    assert rate_state.rate_limit_retry_after == 105.0
+    observe_rate_limit_events(rate_state, ["server_overloaded"], 162.0)
+    assert rate_state.rate_limit_attempts == 0
+    assert rate_state.rate_limit_retry_after == 0.0
+    assert observe_rate_limit_events(rate_state, [RATE_LIMIT], 2000.0) == 2.0
+    rate_state.deferred_events[RATE_LIMIT] = 2000.0
+    assert rate_state.rate_limit_retry_after == 2002.0
+    expire_deferred_events(rate_state, 2029.0, "%0", "test")
+    assert RATE_LIMIT in rate_state.deferred_events
+    expire_deferred_events(rate_state, 2031.0, "%0", "test")
+    assert RATE_LIMIT not in rate_state.deferred_events
+
+    repeated_rate_state = PaneState("test-process", [], (80, 24))
+    repeated_rate_state.rate_limit_attempts = 1
+    assert (
+        observe_rate_limit_events(
+            repeated_rate_state,
+            [RATE_LIMIT],
+            3000.0,
+        )
+        == 2.0
+    )
+    repeated_rate_state.deferred_events[RATE_LIMIT] = 3000.0
+    expire_deferred_events(repeated_rate_state, 3029.0, "%0", "test")
+    assert RATE_LIMIT in repeated_rate_state.deferred_events
+    expire_deferred_events(repeated_rate_state, 3031.0, "%0", "test")
+    assert RATE_LIMIT not in repeated_rate_state.deferred_events
 
     # A real compaction can take longer than one minute. Keep the watcher-owned
     # phase alive for the observed 67-second case while retaining a finite

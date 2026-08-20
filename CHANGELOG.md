@@ -1,5 +1,33 @@
 # Changelog
 
+## v0.2.8 - 2026-08-19
+
+- Recognize Codex's `exceeded retry limit, last status: 429 Too Many Requests`
+  terminal state.
+- Recover the active pane after a guarded 2-second interval for each newly
+  rendered 429 distinguishable within the retained capture window,
+  de-duplicating the same line and resetting on another event.
+- Re-evaluate the current Goal state after the delay: submit `/goal resume` for
+  a recoverable Goal (including `Goal active` paired with the failed turn),
+  and submit `Continue` for every other 429, including one paired with a
+  terminal Goal label.
+- Recognize strict Goal status cells and bottom-pane Goal footer labels without
+  borrowing stale Goal text from an older 429.
+- Add self-test and isolated tmux integration coverage for strict matching,
+  quoted-lookalike rejection, delayed literal `/goal resume` delivery, stale
+  Goal rejection, pane-mode/manual-resume deduplication, and fixed-delay reset.
+- Resolve the exact current tmux server executable from `TMUX` and `/proc`
+  when a long-lived server's background `PATH` cannot find a user-local tmux;
+  keep restart failures bounded and add a no-tmux-`PATH` integration case.
+- Keep recognizing a still-running Codex pane after an npm upgrade moves its
+  native executable under npm's deleted `.codex-<suffix>` staging directory.
+- Restrict native process matching to the supported arm64 and x64 executable
+  tails, and accept only a dim empty-composer placeholder with cursor `x=2`
+  at both pre-send checks.
+- Distinguish the daemon's initial server-wide baseline from sessions and panes
+  discovered later, so a new pane whose first observed frame is already a
+  current 429 still gets the guarded recovery.
+
 ## v0.2.7 - 2026-07-30
 
 - Recognize strict overload and request-failure notices emitted while a remote
