@@ -9,9 +9,10 @@ selected retry states, and Codex's **Keep waiting** safety-buffering choice.
 
 It watches only verified Codex panes and submits a guarded recovery command with
 a real Enter when the evidence is strong enough. Ordinary interrupted turns use
-`Continue`; a retry-limited Goal uses `/goal resume`. It never creates, renames,
-restarts, closes, or kills a tmux session or pane; it only injects documented
-input into an already-running Codex pane.
+`Continue`; a retry-limited recoverable Goal uses `/goal resume`, while every
+other current 429 uses `Continue`. It never creates, renames, restarts, closes,
+or kills a tmux session or pane; it only injects documented input into an
+already-running Codex pane.
 
 > [!WARNING]
 > This plugin injects keys into a verified Codex pane. Retrying an interrupted
@@ -83,9 +84,8 @@ curl --proto '=https' --tlsv1.2 -fsSL \
 | `■ An error occurred while processing ...` | Paste `Continue`, then send a real Enter |
 | `■ internal streaming error, please retry` | Paste `Continue`, then send a real Enter |
 | `■ Our servers are currently overloaded. Please try again later.` | Paste `Continue`, then send a real Enter |
-| `■ exceeded retry limit, last status: 429 Too Many Requests`, with a current recoverable Goal | Wait with bounded backoff, then paste `/goal resume` and send a real Enter |
-| The same 429 state, with no current Goal | Wait with bounded backoff, then paste `Continue` and send a real Enter |
-| The same 429 state, with a complete or budget-limited Goal | No action |
+| `■ exceeded retry limit, last status: 429 Too Many Requests`, with a current recoverable Goal | Wait 2 seconds, then paste `/goal resume` and send a real Enter |
+| The same 429 state, without a current recoverable Goal | Wait 2 seconds, then paste `Continue` and send a real Enter |
 | `⚠ Selected model is at capacity. Please try a different model.` | Paste `Continue`, then send a real Enter |
 | Complete `ⓘ This content can't be shown` Trusted Access notice | Paste `Continue`, then send a real Enter |
 | Complete `■ This content was flagged for possible cybersecurity risk` notice | Paste `Continue`, then send a real Enter |
@@ -102,16 +102,27 @@ Trusted Access requirements. If the same notice keeps recurring, use the toggle
 key to stop automatic retries before it consumes more requests or tokens.
 
 The 429 retry-limit state is deliberately different from an ordinary transient
-error. The first recovery waits one minute, then repeated newly rendered 429
-events use 2, 5, 10, and 15 minute delays (capped at 15 minutes). A different
-Codex event resets this backoff. This prevents a rate-limit response from
-turning the watcher into a request loop while preserving the pane and thread.
+error. Each distinguishable newly rendered 429 in the retained capture window
+waits 2 seconds before the next guarded recovery. The same rendered line is
+de-duplicated, so this does not replay one stale error forever; a new server
+response can be retried after the two-second interval. A different Codex event
+clears the pending 429. The watcher still rechecks the live pane, Goal state,
+process identity, mode, and composer before every submission. The event capture
+retains 400 lines; if an entire 400-line window is replaced between polls by an
+identical 429, the watcher cannot prove novelty and fails closed by skipping it.
 At send time, the watcher re-reads both the strict `• Goal ...` status cell and
 Codex's current bottom-pane Goal footer. A recoverable Goal, including the
 `Goal active` state rendered with the failed 429 turn, selects `/goal resume`;
-no Goal selects `Continue`; a complete or budget-limited Goal cancels the
-automatic action. A Goal status belonging to an older 429 is not reused for a
-newer one.
+every other 429 selects `Continue`. A terminal Goal label prevents only the
+Goal-specific resume; the current 429 still proves that an ordinary turn ended
+abnormally. A Goal status belonging to an older 429 is not reused for a newer
+one.
+
+The daemon's first server-wide scan baselines panes that already existed, so a
+watcher restart does not replay old scrollback. A session or pane discovered
+after that initial scan is live state, not startup history: if its first frame
+already contains a current 429, it enters the same guarded 2-second recovery.
+This is how one watcher covers sessions created later on the same tmux socket.
 
 For a first-principles explanation of Linux processes, PTYs, tmux servers,
 sessions, windows and panes, Codex's TUI/Goal states, the recovery state machine,
@@ -133,7 +144,8 @@ official machine-readable termination reason.
 The watcher fails closed and sends input only after all relevant checks pass:
 
 - The pane's actual foreground process group must contain the native Codex
-  executable under an npm `@openai/codex/.../vendor/.../codex` path.
+  executable under the current npm `@openai/codex` path or its exact supported
+  npm retirement path and native architecture tail.
 - Shells, Claude, dead panes, changed process groups, and disabled tmux servers
   are ignored. Every nonzero tmux pane-mode depth is treated as owning the
   keyboard, including nested copy-mode stacks.
@@ -159,6 +171,11 @@ The watcher fails closed and sends input only after all relevant checks pass:
   that exact event is still the current visible terminal state and the composer
   is empty. Manual `Continue` or `/goal resume`, later output, a new event,
   resize, menu, disable, or timeout cancels the deferred action.
+- The composer may visibly show a dim Codex placeholder (for example,
+  `» Summarize recent commits`). Before sending, styled capture must show that
+  every non-empty character after the prompt glyph is dim and `cursor_x=2`; the
+  cursor is checked again immediately before injection. Normal user text fails
+  closed.
 - Recovery text uses bracketed paste followed by a real Enter. This avoids
   Codex's rapid-character paste-burst handling, which can turn Enter into a
   newline.
@@ -257,7 +274,22 @@ text. If a state is not handled, confirm that the English Codex UI text matches
 the documented column-zero pattern, the npm Codex executable owns the pane's
 foreground process group, the composer is empty, and the pane is not in a tmux
 mode. A matching event first seen in copy mode is retained for at most 30
-seconds and is revalidated after the mode exits.
+seconds and is revalidated after the mode exits. The 2-second 429 interval fits
+inside that same bounded window.
+
+A tmux server keeps the environment from when it started, so its background
+`PATH` can be older than the one in a current interactive shell. The watcher
+does not modify that global environment. On Linux it validates the current
+socket, server PID, owner, process name, and `/proc/<pid>/exe`, then uses that
+same tmux executable when `PATH` cannot resolve `tmux`.
+
+An npm upgrade can leave an already-running Codex process executing from a
+deleted `@openai/.codex-<8-character-retirement-hash>` staging directory. The
+watcher recognizes that npm-retained path as well as the current
+`@openai/codex` path, but requires one of two exact native tails:
+`codex-linux-arm64/vendor/aarch64-unknown-linux-musl/bin/codex` or
+`codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex`. That process must
+also own the pane's foreground process group.
 
 ## Update and uninstall
 
@@ -307,9 +339,9 @@ shellcheck install.sh uninstall.sh tmux-codex-auto-continue.tmux
 sha256sum --check SHA256SUMS
 ```
 
-The built-in tests cover error, interruption, rate-limit backoff, strict Goal
-status/footer parsing and current-event association, complete cybersecurity
-notice signatures, normal and unknown `Worked for` rejection, three-item and
+The built-in tests cover error, interruption, fixed-delay rate-limit recovery,
+strict Goal status/footer parsing and current-event association, complete
+cybersecurity notice signatures, normal and unknown `Worked for` rejection, three-item and
 two-item menu parsing, selected rows, and quoted/stale prompt rejection. The
 integration test uses an isolated tmux server and a native fake-Codex process to
 verify

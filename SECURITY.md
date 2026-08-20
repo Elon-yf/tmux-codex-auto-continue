@@ -23,11 +23,19 @@ configurations during upgrade.
 Cybersecurity notices are actionable only when every logical line, glyph,
 sentence, indentation level, and official URL matches the supported Codex UI
 block. Header-only, quoted, indented, or altered copies fail closed.
-429 retry-limit recovery uses a bounded backoff and resets only after a
-different Codex event; it does not retry in a tight loop. After the delay, a
-strictly associated recoverable Goal selects `/goal resume`, no Goal selects
-`Continue`, and a complete or budget-limited Goal sends nothing. Stale Goal
-text, a manual `/goal resume`, or later output cancels the pending action.
+429 retry-limit recovery waits two seconds after each distinguishable newly
+rendered response in the retained 400-line capture window; the same rendered
+line is de-duplicated rather than retried on every poll. If a whole capture
+window is replaced between polls by an identical 429, novelty cannot be proven
+and the watcher fails closed.
+After the delay, a
+strictly associated recoverable Goal selects `/goal resume`; every other
+current 429 selects `Continue`, including one paired with a terminal Goal
+label. Stale Goal text, a manual `/goal resume`, or later output cancels the
+pending action.
+The composer may contain a dim Codex placeholder, but styled capture must show
+that its non-empty text is entirely dim and the cursor is at `cursor_x=2` twice;
+ordinary user input is never overwritten.
 Submitting either recovery input does not bypass Codex/OpenAI safety controls
 or grant Trusted Access; a repeated refusal can cause another retry until the
 watcher is disabled.

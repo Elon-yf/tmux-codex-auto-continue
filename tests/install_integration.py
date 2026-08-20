@@ -26,10 +26,12 @@ def main() -> int:
         home = root / "home"
         bin_dir = root / "bin"
         fake_bin = root / "fake-bin"
+        empty_path = root / "empty-path"
         runtime = root / "runtime"
         home.mkdir(mode=0o700)
         bin_dir.mkdir(mode=0o700)
         fake_bin.mkdir(mode=0o700)
+        empty_path.mkdir(mode=0o700)
         runtime.mkdir(mode=0o700)
 
         socket = f"/tmp/tmux-codex-install-test-{os.getpid()}"
@@ -117,6 +119,10 @@ def main() -> int:
                 env=environment,
             )
             assert created.returncode == 0, created.stderr
+            hidden_tmux = tmux(
+                "set-environment", "-g", "PATH", str(empty_path)
+            )
+            assert hidden_tmux.returncode == 0, hidden_tmux.stderr
 
             installed = run_installer()
             assert installed.returncode == 0, installed.stdout
@@ -126,6 +132,23 @@ def main() -> int:
             assert "bind-key C-a " in config_text
             assert "prefix+C-a" in installed.stdout
             assert tmux("show-options", "-gqv", "@codex-auto-continue").stdout.strip() == "on"
+            status = subprocess.run(
+                [
+                    "python3",
+                    str(bin_dir / "tmux-codex-auto-continue"),
+                    "--socket",
+                    socket,
+                    "--status",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                env=environment,
+            )
+            assert status.returncode == 0, status.stdout
+            assert "daemon=not running" not in status.stdout, status.stdout
             assert not tmux(
                 "show-options", "-gqv", "@codex-auto-continue-worked"
             ).stdout.strip()

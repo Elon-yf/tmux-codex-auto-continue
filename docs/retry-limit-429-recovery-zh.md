@@ -12,11 +12,10 @@
 
 本次修复的行为规则是：
 
-| 当前终端状态 | 429 退避结束后发送的输入 |
+| 当前终端状态 | 429 的 2 秒等待结束后发送的输入 |
 | --- | --- |
 | 429 仍是当前错误，并且有可恢复的 Goal 状态（active、paused、stalled/blocked、usage limited） | `/goal resume` |
-| 429 仍是当前错误，但没有可恢复的 Goal | `Continue` |
-| Goal 已 complete 或 limited by budget | 不自动把它重新启动 |
+| 429 仍是当前错误，但没有可恢复的 Goal（包括 Goal 已 complete、unmet、abandoned 或 limited by budget） | `Continue` |
 
 这里的“发送”不是调用一个隐藏 API，而是像用户一样向**同一个已经运行的
 Codex CLI 终端**粘贴一行文字，再按一次 Enter。官方 CLI 文档明确列出了
@@ -172,7 +171,37 @@ ps -o pid,pgid,tpgid,stat,cmd -p "$(tmux display-message -p -t %2 '#{pane_pid}')
 插件使用的是同一组 tmux 能力，但通过 `tmux -S <socket>` 明确指定 server，
 避免把输入发到另一个 socket 的 pane。
 
-### 3.3 pane mode 为什么重要
+### 3.3 Python watcher 是怎样被安装和启动的
+
+这里的 `bin` 表示“命令入口目录”，不表示文件已经编译成 CPU 机器码。watcher
+仍是 UTF-8 Python 源码，第一行是：
+
+```python
+#!/usr/bin/env python3
+```
+
+文件具有 `x` 权限时，Linux 读取这行 shebang，并让 Python 解释器执行后面的
+源码。安装器所做的核心动作只是下载、SHA256 校验、自测，以及用
+`install -m 0755` 把同一份文本复制到
+`~/.local/bin/tmux-codex-auto-continue`。这份安装副本和 Git checkout 中的开发
+文件相互独立，所以源码更新后要覆盖安装副本，并让 watcher Python 进程重新启动。
+
+tmux 配置通过 `run-shell -b` 在后台启动这个 Python 命令。tmux server 会保留
+它启动时的环境；如果 tmux 后来才被安装到 `~/.local/bin`，server 的旧 `PATH`
+可能找不到裸命令 `tmux`，即使交互 shell 可以找到。watcher 不修改整个 tmux
+server 的全局 `PATH`，而是验证当前 `TMUX=<socket,pid,...>`、server 所属用户、
+进程名和 `/proc/<pid>/exe`，再调用这个 server 自己对应的 tmux executable。
+这样 user-local tmux 也能从后台启动，同时不会扫描或猜测另一个 server。
+
+npm 升级 Codex 时，已经运行的旧进程不会立即消失；它的 `/proc/<pid>/exe`
+可能显示在 npm 的 `@openai/.codex-<8字符退役哈希>/.../vendor/.../codex (deleted)`
+暂存路径。watcher 同时接受这种 npm 保留路径和当前的 `@openai/codex` 路径，
+但 native 可执行文件尾部必须精确匹配以下两个之一：
+`codex-linux-arm64/vendor/aarch64-unknown-linux-musl/bin/codex` 或
+`codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex`。它仍要求该进程位于
+pane 的前台进程组内，不能只靠 `node` 或进程名判断。
+
+### 3.4 pane mode 为什么重要
 
 当用户按下 prefix+`[` 进入 copy-mode，或打开 tmux 的其他选择界面时，键盘
 不再属于 Codex composer。此时自动发送 `/goal resume` 或 Enter 可能只是滚动
@@ -283,8 +312,8 @@ Goal 状态操作。
 4. composer 为空，没有用户正在输入；
 5. pane 仍由同一个 Codex 前台进程组拥有。
 
-完成状态和 limited-by-budget 状态不会触发 `/goal resume`，避免把已经结束或
-达到硬预算的工作偷偷重新启动。
+完成状态和 limited-by-budget 状态不会触发 `/goal resume`；它们会降级到
+`Continue`，因为当前 429 已经证明普通 turn 异常中断，而不是正常完成。
 
 ## 5. 429 到底发生了什么
 
@@ -314,7 +343,7 @@ Goal 行还增加了第三个问题：普通 `Continue` 和 `/goal resume` 的�
 
 插件每个 0.5 秒轮询一次，但“轮询”不等于“发送”。每个 pane 有一个独立
 的 `PaneState`，保存上一次画面中的事件、进程身份、尺寸、pending 事件、
-退避计数和最近发送时间。
+429 截止时间和最近发送时间。
 
 完整流程如下：
 
@@ -355,11 +384,10 @@ Goal 行还增加了第三个问题：普通 `Continue` 和 `/goal resume` 的�
 └──────┬─────────────────────┘
        │
        ├─ 可恢复 Goal ─► 选择 `/goal resume`
-       ├─ 没有 Goal ───► 选择 `Continue`
-       └─ 终态 Goal ───► 取消，不发送
+       └─ 其他状态 ───► 选择 `Continue`
        ▼
 ┌────────────────┐
-│ bounded backoff │ 429 等待 60/120/300/600/900s
+│ guarded retry   │ 每个新的 429 等待 2s
 └──────┬─────────┘
        ▼
 ┌─────────────────────────┐      任一失败
@@ -374,15 +402,21 @@ Goal 行还增加了第三个问题：普通 `Continue` 和 `/goal resume` 的�
 
 ### 6.1 baseline：为什么 watcher 启动时不立即重放旧错误
 
-watcher 启动或重启时，会把当时已经存在的事件保存为 baseline。否则只要 pane
-里还留着昨天的 429，重启 watcher 就会误认为它是刚发生的新错误，再提交一次
-输入。baseline 是“只处理 watcher 运行期间新观察到的变化”的边界。
+watcher 启动或重启的**第一次全局扫描**会把当时已经存在的 pane 事件保存为
+baseline。否则只要 pane 里还留着昨天的 429，重启 watcher 就会误认为它是
+刚发生的新错误，再提交一次输入。第一次扫描完成后，同一 tmux server 中后来
+新建的 session/pane 不属于启动 baseline；如果 watcher 第一次看见它时当前
+画面已经是 429，也会立刻进入 2 秒恢复流程。这既避免重启重放，也不会漏掉
+“新 session 先报错、后被下一次轮询发现”的情况。
 
 ### 6.2 appended event：为什么同一行不会每半秒触发一次
 
 `capture-pane` 每次都可能返回相同的滚动历史。插件把前后事件列表做尾部/头部
 重叠匹配，只把新增部分视为 `new_events`。同一条错误保持在屏幕上时，事件
-身份不变；Codex 再次渲染一条新的错误记录时，才会出现新的事件。
+身份不变；Codex 再次渲染一条新的错误记录时，才会出现新的事件。事件识别使用
+保留的最近 400 行，并由轮询间的终端 latch 补足通常的窗口滚动；如果在一次
+轮询间隔内超过 400 行全部被新内容替换、且新旧 429 文本完全相同，旧捕获无法
+证明它是“新的一条”，系统会 fail closed（漏掉这次自动恢复，而不是误发输入）。
 
 ### 6.3 settle window：为什么不是一匹配就发
 
@@ -390,27 +424,26 @@ TUI 可能先画错误头，再画 Goal 状态行，再把 composer 恢复出来
 和重绘竞争，导致输入被写入错误位置。短暂 settle window 允许界面稳定，发送
 前还会重新 capture，因此 settle 不是唯一安全措施。
 
-### 6.4 bounded backoff：为什么是 60/120/300/600/900 秒
+### 6.4 429 的 2 秒恢复间隔
 
-429 的根因是请求太早或额度未恢复；短间隔重试会放大问题。每个 pane 的新
-429 使用有界序列：
+watcher 只能看到 Codex TUI 已经渲染出来的 429 文案，不能读取服务端不可见的
+HTTP `Retry-After` 头。按你的使用场景，每个在保留捕获窗口内**可区分的新渲染**
+429 都等待 2 秒，再经过发送前的完整复核：
 
 | 新渲染的第几次 429 | 延迟 |
 | ---: | ---: |
-| 1 | 60 秒 |
-| 2 | 120 秒 |
-| 3 | 300 秒 |
-| 4 | 600 秒 |
-| 5 及以后 | 900 秒封顶 |
+| 任意一次 | 2 秒 |
 
-其他 Codex 事件会重置序列；30 分钟没有新 429 也会重置。这样一次偶发限流
-不会永久污染这个 pane，同时连续限流不会变成请求风暴。
+同一条已经处理过的 429 不会重复计数；其他 Codex 事件会清除挂起的 429。
+因此 2 秒不是无条件盲目按键，而是“新错误出现后，等待 2 秒，再重新确认
+当前画面和 Goal”。如果服务端持续返回新的 429，确实会按这个间隔继续尝试，
+这也是较激进的策略，可能继续受到服务端限流。
 
 ### 6.5 deferred event：为什么 copy-mode 下不能简单丢弃
 
-429 的第一次退避就是 60 秒，而普通 pane-mode 暂存窗口只有 30 秒。如果在
-copy-mode 里观察到 429，不能让普通 TTL 在 30 秒时把它丢掉；该事件会保留到
-计划重试时间之后的有限窗口，但退出 mode 后仍必须重新确认画面没有变化。
+429 的 2 秒间隔短于普通 pane-mode 的 30 秒暂存窗口；如果在 copy-mode 里
+观察到 429，事件会保留到计划重试时间之后的有限窗口，但退出 mode 后仍必须
+重新确认画面没有变化。
 
 ## 7. “当前事件”检查为什么这么严格
 
@@ -426,7 +459,11 @@ copy-mode 里观察到 429，不能让普通 TTL 在 30 秒时把它丢掉；该
    旧 Goal；后者必须仍是当前屏幕 footer，而不是普通回答里提到这些单词。
 4. **其他输出拒绝**：`• Ran ...`、新的 `■`、用户输入或未知行都会取消
    旧 pending。
-5. **composer 空**：底部必须是空的 `› `，不能覆盖用户已经输入的文字。
+5. **composer 空**：普通 capture 里可以看到 Codex 动态绘制的灰色提示，例如
+   `» Summarize recent commits`，这不是用户输入。发送前的 styled capture 必须
+   证明 glyph 后的非空提示字符全部是 dim 样式（或整行确实为空），并且
+   `cursor_x=2`；随后再次读取 cursor，仍必须是 `2`。这样不会覆盖用户已输入的
+   普通样式文字，也不会把动态 placeholder 当成输入。
 6. **没有 tmux mode**：copy-mode、选择菜单等都拥有键盘。
 7. **进程身份没变**：再次读取前台进程组和 native Codex 路径。
 8. **watcher 仍启用**：用户按 toggle 关闭后，所有 pending 都失效。
@@ -455,7 +492,8 @@ watcher 不读取 Goal 数据库，也不猜测 objective 内容。它只从当�
 - `stalled`（Codex 内部通常对应 blocked）
 - `usage limited`
 
-`complete` 和 `limited by budget` 是终止/硬限制状态，不在自动恢复集合中。
+`complete` 和 `limited by budget` 是 Goal 的终止/硬限制状态，不在
+`/goal resume` 集合中；但当前 429 仍走普通 `Continue` 恢复。
 `Time` 的合法形式不只包括 `58m`，还包括 `30s`、`2h`、`1h 2m` 和带天数的
 组合；整小时不能因为没有分钟字段而漏判。零耗时 Goal 可以没有 `Time`，有
 token budget 时还会带 `Tokens: 63.9K/50K.`，所以状态解析不能把时间字段写死。
@@ -473,26 +511,27 @@ footer 只在当前 composer 之后才成立；出现在旧记录或普通回答
              ┌──────────────┴──────────────┐
              │                             │
              ▼                             ▼
-       有 429 + Goal                  有 429 + 无 Goal
+       有可恢复 Goal                  其他全部 429
              │                             │
              ▼                             ▼
        `/goal resume`                 `Continue`
 ```
 
-如果证据表明 Goal 已 complete/limited by budget，第三条分支是不发送。这里
-不能把“有一个终态 Goal”降级成“没有 Goal”，否则 `Continue` 会偷偷开启一个
-本不该开启的新 turn。
+这里不是用 Goal 状态判断“要不要恢复”，而是判断“用哪条恢复命令”。当前 429
+本身已经证明这一轮异常停止；正常完成不会同时留下当前 429。终态 Goal 因此不
+使用 `/goal resume`，但仍用 `Continue` 恢复被中断的普通 turn。
 
 这条分支必须在**实际发送前**再次计算，而不是只在第一次发现错误时计算。
-因为用户可能在等待 60 秒期间手动暂停/清除 Goal，也可能已经手动恢复了它。
+因为用户可能在 2 秒等待期间手动暂停/清除 Goal，也可能已经手动恢复了它。
 发送前看到的状态才是最终依据。
 
 ### 8.3 为什么不会把 `/goal resume` 发给普通 pane
 
 `/goal resume` 是 Codex TUI 的 slash command；普通 shell、非 Codex pane 或
 没有 Goal 的 Codex pane 不应该收到它。进程身份、严格 Goal 状态行、当前 429、
-空 composer 四个条件共同构成门槛。缺一个就回到 `Continue`（如果仍有普通
-429 恢复资格）或直接取消。
+以及 styled composer 空状态四个条件共同构成门槛。只有“当前 429 成立、但没有
+可恢复 Goal 证据”才回到 `Continue`；进程身份、当前事件或 composer 安全检查
+失败时会直接取消，绝不会向不确定的 pane 注入输入。
 
 ## 9. 实际输入是怎样注入的
 
@@ -519,10 +558,10 @@ footer 只在当前 composer 之后才成立；出现在旧记录或普通回答
 | --- | --- |
 | 事件词法识别 | `RATE_LIMIT_RE`、Goal 状态正则和 `event_records()` |
 | pane 身份 | `list_panes()`、`codex_process_identity()`、`/proc` 读取 |
-| 当前画面 | `capture_visible_text()`、`capture_event_text()` |
+| 当前画面 | `capture_visible_text()`、`capture_event_text()`、styled composer capture |
 | 去重 | `appended_events()` |
 | 当前事件验证 | `terminal_event_is_current_text()`、`terminal_suffix_is_idle()` |
-| 429 退避 | `PaneState.rate_limit_*`、`observe_rate_limit_events()` |
+| 429 固定等待 | `PaneState.rate_limit_*`、`observe_rate_limit_events()` |
 | pending/deferred | `schedule_pending()`、`defer_events()`、`expire_deferred_events()` |
 | Goal/普通动作选择 | Goal 状态解析及发送前的动作重判定 |
 | 输入注入 | `submit_text()` |
@@ -536,7 +575,7 @@ Codex Goal 状态 ──通过 TUI 状态行被观察──► watcher PaneState
 watcher PaneState ──通过 tmux 输入──► Codex TUI 命令
 ```
 
-watcher 重启后会丢失自己的退避计数并重新 baseline；它不会因此删除或创建
+watcher 重启后会丢失自己的待发截止时间并重新 baseline；它不会因此删除或创建
 Codex Goal。
 
 ## 11. 如何测试：每个测试证明什么
@@ -552,13 +591,13 @@ python3 bin/tmux-codex-auto-continue --self-test
 - 正确 429 文案和允许的 `---` 尾缀；
 - 去掉 `■`、加缩进、加 `›` 引用、改状态码、改英文文案均拒绝；
 - active/paused/stalled/usage-limited Goal trailer 与 footer 的识别；
-- complete/limited-by-budget 不选择 `/goal resume` 或 `Continue`；
+- complete/limited-by-budget 不选择 `/goal resume`，而选择 `Continue`；
 - 429 + Goal 选择 `/goal resume`；
 - 429 + 无 Goal 选择 `Continue`；
 - 旧 429 前后的 Goal 不能被错误地借给当前 429；
 - `Time: 2h.` 这样的整点时长不会漏判；
 - 新输出、手动输入、Goal 状态消失会取消旧事件；
-- 退避序列和重置条件；
+- 2 秒固定等待、同一行去重和重置条件；
 - pane-mode 延迟事件的保留边界。
 
 ### 11.2 worked integration
@@ -572,9 +611,10 @@ python3 tests/worked_integration.py
 
 1. 普通可恢复事件仍收到 `Continue`；
 2. 429 + Goal 状态在短时间内不会发送任何输入；
-3. 第一阶段退避结束后收到且只收到一次字面量 `/goal resume`；
-4. 不创建、重命名、重启或杀死测试 pane；
-5. copy-mode、菜单、手动输入、watcher 重启和安装迁移回归不受影响。
+3. 2 秒等待结束后收到且只收到一次字面量 `/goal resume`；
+4. 同一条 429 不重复发送，第二条新 429 再等待 2 秒后发送一次；
+5. 不创建、重命名、重启或杀死测试 pane；
+6. copy-mode、菜单、手动输入、watcher 重启和安装迁移回归不受影响。
 
 “429 无 Goal -> `Continue`”的分支由 self-test 覆盖；集成测试重点证明真正
 经过 tmux bracketed-paste 和 Enter 后，fake Codex 收到的是 `/goal resume`，
@@ -598,19 +638,19 @@ git diff --check
 ### 能解决
 
 - watcher 运行期间，准确识别当前 pane 的 429 retry-limit 文案；
-- 在限流窗口内停止重复请求；
+- 同一条已渲染的 429 不会在每次轮询时重复发送；
 - 保留同一个 Codex pane/thread，不新建 session；
-- 有可恢复 Goal 时使用 `/goal resume`，无 Goal 时使用 `Continue`；
+- 有可恢复 Goal 时使用 `/goal resume`，其他 429 使用 `Continue`；
 - 用户接管键盘、改变 pane 或关闭 watcher 时 fail closed。
 
 ### 不能保证
 
 - 账号额度已经恢复；如果服务端仍拒绝，下一次仍可能是 429；
 - Codex 改变英文 UI 文案或状态行布局后的兼容性；未知布局会被忽略；
-- watcher 自己重启后恢复之前内存里的退避计数；
+- watcher 自己重启后恢复之前内存里的待发截止时间；
 - 跨机器、跨 tmux server、跨 Codex session 的任务调度；
 - Goal 数据库、权限审批、模型选择、业务 checkpoint 或远程 GPU 租约；
-- 把已经 complete/limited-by-budget 的 Goal 强行重新打开。
+- 用 `/goal resume` 把已经 complete/limited-by-budget 的 Goal 强行重新打开；
 
 ### 为什么这些边界是必要的
 
@@ -626,7 +666,8 @@ runtime 状态不一致，形成更难排查的“假恢复”。当前设计只
 出现 429 时：
   1. watcher 先等待，不会立刻连发请求；
   2. 如果画面显示可恢复 Goal 状态，等待结束后输入 /goal resume；
-  3. 如果没有 Goal，等待结束后输入 Continue；
+  3. 其他全部状态（无 Goal 或 Goal 已 complete/unmet/abandoned/limited by budget），
+     等待结束后输入 Continue；
   4. 如果你正在 copy-mode、输入文字或关闭 watcher，自动动作会取消。
 ```
 
