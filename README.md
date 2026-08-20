@@ -7,10 +7,11 @@
 An unofficial Linux tmux watcher that recovers interrupted Codex CLI turns,
 selected retry states, and Codex's **Keep waiting** safety-buffering choice.
 
-It watches only verified Codex panes and submits `Continue` with a real Enter
-when the evidence is strong enough. It never creates, renames, restarts, closes,
-or kills a tmux session or pane; it only injects the documented input into an
-already-running Codex pane.
+It watches only verified Codex panes and submits a guarded recovery command with
+a real Enter when the evidence is strong enough. Ordinary interrupted turns use
+`Continue`; a retry-limited Goal uses `/goal resume`. It never creates, renames,
+restarts, closes, or kills a tmux session or pane; it only injects documented
+input into an already-running Codex pane.
 
 > [!WARNING]
 > This plugin injects keys into a verified Codex pane. Retrying an interrupted
@@ -82,7 +83,9 @@ curl --proto '=https' --tlsv1.2 -fsSL \
 | `■ An error occurred while processing ...` | Paste `Continue`, then send a real Enter |
 | `■ internal streaming error, please retry` | Paste `Continue`, then send a real Enter |
 | `■ Our servers are currently overloaded. Please try again later.` | Paste `Continue`, then send a real Enter |
-| `■ exceeded retry limit, last status: 429 Too Many Requests` | Wait with bounded backoff, then paste `Continue` and send a real Enter |
+| `■ exceeded retry limit, last status: 429 Too Many Requests`, with a current recoverable Goal | Wait with bounded backoff, then paste `/goal resume` and send a real Enter |
+| The same 429 state, with no current Goal | Wait with bounded backoff, then paste `Continue` and send a real Enter |
+| The same 429 state, with a complete or budget-limited Goal | No action |
 | `⚠ Selected model is at capacity. Please try a different model.` | Paste `Continue`, then send a real Enter |
 | Complete `ⓘ This content can't be shown` Trusted Access notice | Paste `Continue`, then send a real Enter |
 | Complete `■ This content was flagged for possible cybersecurity risk` notice | Paste `Continue`, then send a real Enter |
@@ -102,10 +105,18 @@ The 429 retry-limit state is deliberately different from an ordinary transient
 error. The first recovery waits one minute, then repeated newly rendered 429
 events use 2, 5, 10, and 15 minute delays (capped at 15 minutes). A different
 Codex event resets this backoff. This prevents a rate-limit response from
-turning the watcher into a request loop while preserving the active goal and
-pane session. The strictly structured `Goal active` status cell rendered after
-this error is treated as informational; other later output still cancels the
-recovery.
+turning the watcher into a request loop while preserving the pane and thread.
+At send time, the watcher re-reads both the strict `• Goal ...` status cell and
+Codex's current bottom-pane Goal footer. A recoverable Goal, including the
+`Goal active` state rendered with the failed 429 turn, selects `/goal resume`;
+no Goal selects `Continue`; a complete or budget-limited Goal cancels the
+automatic action. A Goal status belonging to an older 429 is not reused for a
+newer one.
+
+For a first-principles explanation of Linux processes, PTYs, tmux servers,
+sessions, windows and panes, Codex's TUI/Goal states, the recovery state machine,
+and why these branches differ, see
+[429 and Goal recovery mechanics](docs/retry-limit-429-recovery-zh.md) (Chinese).
 
 Normal completed turns are always ignored. For a `Worked for` marker, the
 watcher looks for Codex's final-response boundary immediately before the last
@@ -142,14 +153,15 @@ The watcher fails closed and sends input only after all relevant checks pass:
 - After Down, the watcher re-captures the screen and confirms `Keep waiting`
   before Enter. It latches the handled menu until the menu disappears.
 - The ordinary event/recovery path rechecks that no selection menu owns the
-  keyboard immediately before it sends `Continue`.
+  keyboard immediately before it sends `Continue` or `/goal resume`.
 - Retry/interruption events first seen while a pane mode owns the keyboard are
   retained for at most 30 seconds. After mode exits, the watcher sends only if
   that exact event is still the current visible terminal state and the composer
-  is empty. Manual `Continue`, later output, a new event, resize, menu, disable,
-  or timeout cancels the deferred action.
-- `Continue` uses bracketed paste followed by a real Enter. This avoids Codex's
-  rapid-character paste-burst handling, which can turn Enter into a newline.
+  is empty. Manual `Continue` or `/goal resume`, later output, a new event,
+  resize, menu, disable, or timeout cancels the deferred action.
+- Recovery text uses bracketed paste followed by a real Enter. This avoids
+  Codex's rapid-character paste-burst handling, which can turn Enter into a
+  newline.
 - Matching, pane inspection, and key injection happen locally. The running
   watcher makes no network requests and never uploads pane contents; only the
   installer/update commands contact the configured raw GitHub URL.
@@ -295,14 +307,16 @@ shellcheck install.sh uninstall.sh tmux-codex-auto-continue.tmux
 sha256sum --check SHA256SUMS
 ```
 
-The built-in tests cover error, interruption, rate-limit backoff, and complete
-cybersecurity-notice signatures, normal and unknown `Worked for` rejection,
-three-item and two-item menu parsing, selected rows, and quoted/stale prompt
-rejection. The integration test uses an isolated tmux server and a native
-fake-Codex process to verify
+The built-in tests cover error, interruption, rate-limit backoff, strict Goal
+status/footer parsing and current-event association, complete cybersecurity
+notice signatures, normal and unknown `Worked for` rejection, three-item and
+two-item menu parsing, selected rows, and quoted/stale prompt rejection. The
+integration test uses an isolated tmux server and a native fake-Codex process to
+verify
 normal-completion suppression, both strict cybersecurity-notice paths,
 history-backed interrupted-turn recovery, quoted-line rejection, bounded
-pane-mode recovery, manual-recovery deduplication, and watcher-only restart.
+pane-mode recovery, literal `/goal resume` delivery, manual-recovery
+deduplication, and watcher-only restart.
 The installer integration verifies fresh configuration, legacy-option
 migration, managed key rewrites, unmarked-config warnings, and `--no-config`
 behavior. Separately, the safety-menu path was exercised against an isolated

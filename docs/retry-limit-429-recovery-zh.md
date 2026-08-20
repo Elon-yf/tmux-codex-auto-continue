@@ -232,19 +232,21 @@ cell，不是一次新的 assistant/tool turn；这正是截图中 429 后面那
 横向位置，但 Codex 0.147.0 的状态文案是：
 
 ```text
-Pursuing goal (58m)                    # active
-Goal paused (/goal resume)             # paused
-Goal stalled (/goal resume)            # blocked/stalled
-Goal hit usage limits (/goal resume)   # usage limited
-Goal unmet (50K / 50K)                 # limited by budget
-Goal abandoned                         # limited by budget、无用量文本
-Goal achieved (58m)                    # complete
+  gpt-5.4                 Pursuing goal (58m)                    # active
+  gpt-5.4                 Goal paused (/goal resume)             # paused
+  gpt-5.4                 Goal stalled (/goal resume)            # blocked/stalled
+  gpt-5.4                 Goal hit usage limits (/goal resume)   # usage limited
+  gpt-5.4                 Goal unmet (50K / 50K tokens)          # limited by budget
+  gpt-5.4                 Goal abandoned                         # limited by budget、无用量文本
+  gpt-5.4                 Goal achieved (58m)                    # complete
 ```
 
 因此你看到右下角的 `Goal stalled (/goal resume)` 不是按钮，也不是终端模拟器
-添加的提示；它是 **Codex TUI 自己给出的 slash-command 操作提示**。tmux 的
-`capture-pane` 读取的是整张字符网格，所以 watcher 能看到该 footer，之后仍然
-只能通过向 pane 的 PTY 输入字面量 `/goal resume` 来执行它。
+添加的提示；它是 **Codex TUI 自己给出的 slash-command 操作提示**。左边的
+模型、目录等信息和右边 Goal 文案由 TUI 画在同一行，右侧位置随 pane 宽度
+改变；这一行不以记录区的 `•` 开头。tmux 的 `capture-pane` 读取的是整张字符
+网格，所以 watcher 能看到该 footer，之后仍然只能通过向 pane 的 PTY 输入
+字面量 `/goal resume` 来执行它。
 
 ### 4.3 为什么 Goal 要用 `/goal resume`
 
@@ -440,9 +442,10 @@ watcher 不读取 Goal 数据库，也不猜测 objective 内容。它只从当�
 两种官方渲染结构识别状态：
 
 ```text
-• Goal <status> Objective: <非空文本> Time: <合法时长>.
+• Goal <status> Objective: <非空文本> [Time: <合法时长>.] [Tokens: <已用>/<预算>.]
 
-                                      Goal stalled (/goal resume)
+› Ask Codex to do anything
+  gpt-5.6-sol default                  Goal stalled (/goal resume)
 ```
 
 其中 `<status>` 的恢复集合是：
@@ -454,7 +457,10 @@ watcher 不读取 Goal 数据库，也不猜测 objective 内容。它只从当�
 
 `complete` 和 `limited by budget` 是终止/硬限制状态，不在自动恢复集合中。
 `Time` 的合法形式不只包括 `58m`，还包括 `30s`、`2h`、`1h 2m` 和带天数的
-组合；整小时不能因为没有分钟字段而漏判。
+组合；整小时不能因为没有分钟字段而漏判。零耗时 Goal 可以没有 `Time`，有
+token budget 时还会带 `Tokens: 63.9K/50K.`，所以状态解析不能把时间字段写死。
+footer 只在当前 composer 之后才成立；出现在旧记录或普通回答里的同一句文字
+不能作为 Goal 证据。
 
 ### 8.2 动作矩阵
 
@@ -594,7 +600,7 @@ git diff --check
 - watcher 运行期间，准确识别当前 pane 的 429 retry-limit 文案；
 - 在限流窗口内停止重复请求；
 - 保留同一个 Codex pane/thread，不新建 session；
-- 有 Goal 时使用 `/goal resume`，无 Goal 时使用 `Continue`；
+- 有可恢复 Goal 时使用 `/goal resume`，无 Goal 时使用 `Continue`；
 - 用户接管键盘、改变 pane 或关闭 watcher 时 fail closed。
 
 ### 不能保证
@@ -608,8 +614,8 @@ git diff --check
 
 ### 为什么这些边界是必要的
 
-如果插件直接改 Codex 的内部数据库或绕过 CLI 状态机，它可能让 UI 显示 active
-但 runtime 仍是 paused，造成更难排查的“假恢复”。当前设计只使用 Codex 自己
+如果插件直接改 Codex 的内部数据库或绕过 CLI 状态机，它可能造成 UI 状态和
+runtime 状态不一致，形成更难排查的“假恢复”。当前设计只使用 Codex 自己
 公开给终端用户的 `/goal resume` 命令，因此状态转换仍由 Codex 完成。
 
 ## 13. 从用户视角的最短操作说明

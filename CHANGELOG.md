@@ -6,9 +6,15 @@
   terminal state.
 - Recover the active pane after a bounded 1/2/5/10/15 minute backoff sequence,
   resetting the delay after a different Codex event to avoid a tight retry loop.
+- Re-evaluate the current Goal state after the delay: submit `/goal resume` for
+  a recoverable Goal (including `Goal active` paired with the failed turn),
+  retain `Continue` only for a 429 without a Goal, and send nothing for a
+  complete or budget-limited Goal.
+- Recognize strict Goal status cells and bottom-pane Goal footer labels without
+  borrowing stale Goal text from an older 429.
 - Add self-test and isolated tmux integration coverage for strict matching,
-  quoted-lookalike rejection, delayed recovery, the trailing `Goal active`
-  status cell, pane-mode deferral, and backoff reset.
+  quoted-lookalike rejection, delayed literal `/goal resume` delivery, stale
+  Goal rejection, pane-mode/manual-resume deduplication, and backoff reset.
 
 ## v0.2.7 - 2026-07-30
 

@@ -24,6 +24,10 @@ Cybersecurity notices are actionable only when every logical line, glyph,
 sentence, indentation level, and official URL matches the supported Codex UI
 block. Header-only, quoted, indented, or altered copies fail closed.
 429 retry-limit recovery uses a bounded backoff and resets only after a
-different Codex event; it does not retry in a tight loop. Submitting `Continue`
-does not bypass Codex/OpenAI safety controls or grant Trusted Access; a repeated
-refusal can cause another retry until the watcher is disabled.
+different Codex event; it does not retry in a tight loop. After the delay, a
+strictly associated recoverable Goal selects `/goal resume`, no Goal selects
+`Continue`, and a complete or budget-limited Goal sends nothing. Stale Goal
+text, a manual `/goal resume`, or later output cancels the pending action.
+Submitting either recovery input does not bypass Codex/OpenAI safety controls
+or grant Trusted Access; a repeated refusal can cause another retry until the
+watcher is disabled.
