@@ -82,6 +82,7 @@ curl --proto '=https' --tlsv1.2 -fsSL \
 | `■ An error occurred while processing ...` | Paste `Continue`, then send a real Enter |
 | `■ internal streaming error, please retry` | Paste `Continue`, then send a real Enter |
 | `■ Our servers are currently overloaded. Please try again later.` | Paste `Continue`, then send a real Enter |
+| `■ exceeded retry limit, last status: 429 Too Many Requests` | Wait with bounded backoff, then paste `Continue` and send a real Enter |
 | `⚠ Selected model is at capacity. Please try a different model.` | Paste `Continue`, then send a real Enter |
 | Complete `ⓘ This content can't be shown` Trusted Access notice | Paste `Continue`, then send a real Enter |
 | Complete `■ This content was flagged for possible cybersecurity risk` notice | Paste `Continue`, then send a real Enter |
@@ -96,6 +97,15 @@ Each newly rendered supported cybersecurity notice is treated as a new retry
 event. This only submits `Continue`; it does not bypass safety checks or satisfy
 Trusted Access requirements. If the same notice keeps recurring, use the toggle
 key to stop automatic retries before it consumes more requests or tokens.
+
+The 429 retry-limit state is deliberately different from an ordinary transient
+error. The first recovery waits one minute, then repeated newly rendered 429
+events use 2, 5, 10, and 15 minute delays (capped at 15 minutes). A different
+Codex event resets this backoff. This prevents a rate-limit response from
+turning the watcher into a request loop while preserving the active goal and
+pane session. The strictly structured `Goal active` status cell rendered after
+this error is treated as informational; other later output still cancels the
+recovery.
 
 Normal completed turns are always ignored. For a `Worked for` marker, the
 watcher looks for Codex's final-response boundary immediately before the last
@@ -285,10 +295,11 @@ shellcheck install.sh uninstall.sh tmux-codex-auto-continue.tmux
 sha256sum --check SHA256SUMS
 ```
 
-The built-in tests cover error, interruption, and complete cybersecurity-notice
-signatures, normal and unknown `Worked for` rejection, three-item and two-item
-menu parsing, selected rows, and quoted/stale prompt rejection. The integration
-test uses an isolated tmux server and a native fake-Codex process to verify
+The built-in tests cover error, interruption, rate-limit backoff, and complete
+cybersecurity-notice signatures, normal and unknown `Worked for` rejection,
+three-item and two-item menu parsing, selected rows, and quoted/stale prompt
+rejection. The integration test uses an isolated tmux server and a native
+fake-Codex process to verify
 normal-completion suppression, both strict cybersecurity-notice paths,
 history-backed interrupted-turn recovery, quoted-line rejection, bounded
 pane-mode recovery, manual-recovery deduplication, and watcher-only restart.

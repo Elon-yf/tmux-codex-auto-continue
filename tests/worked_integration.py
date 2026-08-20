@@ -415,6 +415,26 @@ def main() -> int:
             time.sleep(0.25)
         assert capture().count(SUBMITTED_MARKER) == 11, diagnostics()
 
+        # A 429 retry-limit marker is recovered with a bounded delay rather
+        # than immediately retried in a tight loop. The first retry is one
+        # minute later; the unit test covers the backoff sequence and this
+        # integration test verifies that the marker is nevertheless recovered.
+        rate_limit = (
+            "■ exceeded retry limit, last status: 429 Too Many Requests"
+        )
+        emit_lines(
+            rate_limit,
+            "• Goal active Objective: resume this work Time: 58m.",
+        )
+        time.sleep(3.0)
+        assert capture().count(SUBMITTED_MARKER) == 11, diagnostics()
+        deadline = time.monotonic() + 65
+        while time.monotonic() < deadline:
+            if capture().count(SUBMITTED_MARKER) == 12:
+                break
+            time.sleep(0.25)
+        assert capture().count(SUBMITTED_MARKER) == 12, diagnostics()
+
         restarted = subprocess.run(
             ["python3", str(WATCHER), "--socket", socket, "--restart"],
             stdout=subprocess.PIPE,

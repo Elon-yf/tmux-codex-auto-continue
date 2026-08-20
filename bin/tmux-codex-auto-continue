@@ -25,6 +25,8 @@ SETTLE_SECONDS = 1.5
 MIN_SEND_GAP_SECONDS = 2.0
 DEFERRED_EVENT_TTL_SECONDS = 30.0
 CONTEXT_COMPACTION_TTL_SECONDS = 5 * 60.0
+RATE_LIMIT_RETRY_DELAYS_SECONDS = (60.0, 120.0, 300.0, 600.0, 900.0)
+RATE_LIMIT_RETRY_RESET_SECONDS = 30 * 60.0
 MIN_MENU_ATTEMPT_GAP_SECONDS = 2.0
 MENU_REDRAW_TIMEOUT_SECONDS = 0.75
 MENU_REDRAW_POLL_SECONDS = 0.05
@@ -35,7 +37,7 @@ REPLY = "Continue"
 COMPACT_COMMAND = "/compact"
 OPTION_NAME = "@codex-auto-continue"
 EMPTY_COMPOSER_CURSOR_X = 2
-VERSION = "0.2.7"
+VERSION = "0.2.8"
 
 # Requiring Codex's exact event glyph and structure in column zero avoids
 # matching quoted text in user prompts, assistant messages, or shell output.
@@ -56,6 +58,16 @@ SERVER_OVERLOADED_RE = re.compile(
     r"^■ (?:Error running remote compact task: )?"
     r"Our servers are currently overloaded\. Please try again later\."
     r"(?:[ \t]+---)?[ \t]*$",
+    re.MULTILINE,
+)
+RATE_LIMIT_RE = re.compile(
+    r"^■ exceeded retry limit, last status: 429 Too Many Requests"
+    r"(?:[ \t]+---)?[ \t]*$",
+    re.MULTILINE,
+)
+GOAL_ACTIVE_STATUS_RE = re.compile(
+    r"^• Goal active Objective: \S(?:.*\S)? Time: "
+    r"(?:(?:\d+d )?(?:\d+h )?\d+m(?: \d+s)?|\d+s)\.[ \t]*$",
     re.MULTILINE,
 )
 CONTEXT_TOO_LARGE_HEADER_RE = re.compile(
@@ -102,6 +114,7 @@ WORKED_COMPLETE = "worked_complete"
 WORKED_UNKNOWN = "worked_unknown"
 CONTEXT_TOO_LARGE = "context_too_large"
 CONTEXT_COMPACTED = "context_compacted"
+RATE_LIMIT = "rate_limit"
 NON_ACTIONABLE_EVENTS = frozenset(
     {WORKED_COMPLETE, WORKED_UNKNOWN, CONTEXT_COMPACTED}
 )
@@ -153,6 +166,9 @@ class PaneState:
     context_compacted_seen: bool = False
     context_retry_seen: bool = False
     context_compaction_started: float = 0.0
+    rate_limit_attempts: int = 0
+    rate_limit_last_seen: float = 0.0
+    rate_limit_retry_after: float = 0.0
     send_after: float = 0.0
     last_sent: float = 0.0
     last_menu_attempt: float = 0.0
@@ -281,6 +297,9 @@ def event_records(text: str) -> list[tuple[int, int, str]]:
     for match in SERVER_OVERLOADED_RE.finditer(text):
         matches.append((match.start(), match.end(), "server_overloaded"))
 
+    for match in RATE_LIMIT_RE.finditer(text):
+        matches.append((match.start(), match.end(), RATE_LIMIT))
+
     matches.extend(context_too_large_records(text))
 
     for match in CONTEXT_COMPACTED_RE.finditer(text):
@@ -376,7 +395,13 @@ def terminal_event_is_current_text(
         return False
 
     _, end, _ = records[-1]
-    if not terminal_suffix_is_idle(validation_text[end:]):
+    suffix = validation_text[end:]
+    if event == RATE_LIMIT:
+        # A failed goal turn renders this informational status cell after the
+        # error. It does not represent a newer turn or user input. Keep the
+        # exception strict and scoped only to the 429 recovery path.
+        suffix = GOAL_ACTIVE_STATUS_RE.sub("", suffix)
+    if not terminal_suffix_is_idle(suffix):
         return False
 
     if event == WORKED_INTERRUPTED:
@@ -737,6 +762,44 @@ def clear_compaction_wait(state: PaneState) -> None:
     state.deferred_events.pop(CONTEXT_COMPACTED, None)
 
 
+def observe_rate_limit_events(
+    state: PaneState,
+    events: list[str],
+    now: float,
+) -> float | None:
+    """Record newly rendered 429s and return the latest backoff delay."""
+
+    latest_delay: float | None = None
+    for event in events:
+        if event == RATE_LIMIT:
+            if (
+                state.rate_limit_last_seen
+                and now - state.rate_limit_last_seen
+                > RATE_LIMIT_RETRY_RESET_SECONDS
+            ):
+                state.rate_limit_attempts = 0
+            delay_index = min(
+                state.rate_limit_attempts,
+                len(RATE_LIMIT_RETRY_DELAYS_SECONDS) - 1,
+            )
+            latest_delay = RATE_LIMIT_RETRY_DELAYS_SECONDS[delay_index]
+            state.rate_limit_attempts += 1
+            state.rate_limit_last_seen = now
+            state.rate_limit_retry_after = max(
+                state.rate_limit_retry_after,
+                now + latest_delay,
+            )
+        else:
+            clear_rate_limit_backoff(state)
+    return latest_delay
+
+
+def clear_rate_limit_backoff(state: PaneState) -> None:
+    state.rate_limit_attempts = 0
+    state.rate_limit_last_seen = 0.0
+    state.rate_limit_retry_after = 0.0
+
+
 def reply_for_events(events: list[str]) -> str:
     if events and events[-1] == CONTEXT_TOO_LARGE:
         return COMPACT_COMMAND
@@ -758,6 +821,8 @@ def schedule_pending(
         now + SETTLE_SECONDS,
         state.last_sent + MIN_SEND_GAP_SECONDS,
     )
+    if RATE_LIMIT in events:
+        state.send_after = max(state.send_after, state.rate_limit_retry_after)
 
 
 def defer_events(
@@ -781,7 +846,16 @@ def expire_deferred_events(
     state: PaneState, now: float, pane: str, session: str
 ) -> None:
     for event, seen_at in list(state.deferred_events.items()):
-        if now - seen_at <= DEFERRED_EVENT_TTL_SECONDS:
+        expires_at = seen_at + DEFERRED_EVENT_TTL_SECONDS
+        if event == RATE_LIMIT:
+            # The intentional 429 backoff is longer than the ordinary
+            # pane-mode deferral. Preserve it until one deferred-event window
+            # after its scheduled retry, while still revalidating the live UI.
+            expires_at = max(
+                expires_at,
+                state.rate_limit_retry_after + DEFERRED_EVENT_TTL_SECONDS,
+            )
+        if now <= expires_at:
             continue
         del state.deferred_events[event]
         state.pending_events.discard(event)
@@ -1049,12 +1123,19 @@ def run_daemon(socket: str) -> int:
                 state.events = events
                 state.geometry = geometry
                 clear_pending(state)
+                clear_rate_limit_backoff(state)
                 state.deferred_events.clear()
                 log(f"rebaselined resized Codex pane {pane} in session {session}")
                 continue
 
             new_events = appended_events(state.events, events)
             state.events = events
+            rate_limit_delay = observe_rate_limit_events(state, new_events, now)
+            if rate_limit_delay is not None:
+                log(
+                    f"delaying rate-limit recovery for pane {pane} "
+                    f"({session}) by {rate_limit_delay:.0f}s"
+                )
 
             menu_selection = capture_safety_menu_selection(socket, pane)
             if menu_selection is None:
@@ -1088,6 +1169,7 @@ def run_daemon(socket: str) -> int:
                     state.safety_menu_latched = True
                 clear_pending(state)
                 clear_compaction_wait(state)
+                clear_rate_limit_backoff(state)
                 state.deferred_events.clear()
                 continue
 
@@ -1172,6 +1254,7 @@ def run_daemon(socket: str) -> int:
                 if menu_selection is not None:
                     state.safety_menu_latched = True
                     clear_compaction_wait(state)
+                    clear_rate_limit_backoff(state)
                     state.deferred_events.clear()
                 clear_pending(state)
                 continue
@@ -1181,6 +1264,7 @@ def run_daemon(socket: str) -> int:
                 # to composer-oriented error recovery while it is visible.
                 clear_pending(state)
                 clear_compaction_wait(state)
+                clear_rate_limit_backoff(state)
                 state.deferred_events.clear()
                 if (
                     menu_selection in {"retry", "wait"}
@@ -1329,6 +1413,7 @@ def run_daemon(socket: str) -> int:
             if not option_enabled(socket):
                 clear_pending(state)
                 clear_compaction_wait(state)
+                clear_rate_limit_backoff(state)
                 state.deferred_events.clear()
                 continue
             current_events = current_terminal_events(
@@ -1343,6 +1428,8 @@ def run_daemon(socket: str) -> int:
                 ):
                     clear_compaction_wait(state)
                     state.deferred_events.clear()
+                if RATE_LIMIT in state.pending_events:
+                    clear_rate_limit_backoff(state)
                 clear_pending(state)
                 continue
             state.pending_events.intersection_update(current_events)
@@ -1552,6 +1639,7 @@ def self_test() -> int:
                 "Please include the request ID "
                 "30f0c0fa-d1dc-4c5f-8c63-f2909d6f0fc3 in your message."
             ),
+            "■ exceeded retry limit, last status: 429 Too Many Requests",
             (
                 "› quoted: 1. ─ Worked for 15m 36s ────── 2. ■ An error "
                 "occurred while processing your request. ■ internal streaming "
@@ -1589,6 +1677,7 @@ def self_test() -> int:
         "server_overloaded",
         "server_overloaded",
         "error:30f0c0fa-d1dc-4c5f-8c63-f2909d6f0fc3",
+        "rate_limit",
         "capacity",
         "cyber_content_blocked",
         "cyber_risk_flagged",
@@ -1720,6 +1809,30 @@ def self_test() -> int:
         f"  {remote_error}",
     ):
         assert event_signatures(quoted_remote_event) == []
+    rate_limit = "■ exceeded retry limit, last status: 429 Too Many Requests"
+    assert event_signatures(rate_limit) == [RATE_LIMIT]
+    assert event_signatures(f"{rate_limit}  ---   ") == [RATE_LIMIT]
+    for quoted_rate_limit in (
+        rate_limit.removeprefix("■ "),
+        f"› {rate_limit}",
+        f"  {rate_limit}",
+        rate_limit.replace("429", "500", 1),
+        rate_limit.replace("Too Many Requests", "Request Timeout", 1),
+    ):
+        assert event_signatures(quoted_rate_limit) == []
+    goal_active = (
+        "• Goal active Objective: 现在做的就是goal Time: 58m."
+    )
+    current_rate_limit = f"{rate_limit}\n\n{goal_active}\n\n› "
+    assert terminal_event_is_current_text(current_rate_limit, RATE_LIMIT)
+    assert not terminal_event_is_current_text(
+        current_rate_limit.replace("Goal active", "Goal paused"),
+        RATE_LIMIT,
+    )
+    assert not terminal_event_is_current_text(
+        f"{current_rate_limit}\n• Ran a newer action",
+        RATE_LIMIT,
+    )
     capacity = "Selected model is at capacity. Please try a different model."
     assert event_signatures(f"⚠ {capacity}") == ["capacity"]
     assert event_signatures(f"⚠ {capacity}\n⚠ {capacity}") == [
@@ -2003,6 +2116,22 @@ def self_test() -> int:
         [first_error],
         [first_error, second_error],
     ) == [second_error]
+
+    rate_state = PaneState("test-process", [], (80, 24))
+    assert observe_rate_limit_events(rate_state, [RATE_LIMIT], 100.0) == 60.0
+    assert rate_state.rate_limit_retry_after == 160.0
+    assert observe_rate_limit_events(rate_state, [RATE_LIMIT], 161.0) == 120.0
+    assert rate_state.rate_limit_retry_after == 281.0
+    observe_rate_limit_events(rate_state, ["server_overloaded"], 162.0)
+    assert rate_state.rate_limit_attempts == 0
+    assert rate_state.rate_limit_retry_after == 0.0
+    assert observe_rate_limit_events(rate_state, [RATE_LIMIT], 2000.0) == 60.0
+    rate_state.deferred_events[RATE_LIMIT] = 2000.0
+    assert rate_state.rate_limit_retry_after == 2060.0
+    expire_deferred_events(rate_state, 2031.0, "%0", "test")
+    assert RATE_LIMIT in rate_state.deferred_events
+    expire_deferred_events(rate_state, 2091.0, "%0", "test")
+    assert RATE_LIMIT not in rate_state.deferred_events
 
     # A real compaction can take longer than one minute. Keep the watcher-owned
     # phase alive for the observed 67-second case while retaining a finite

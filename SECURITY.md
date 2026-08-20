@@ -10,7 +10,7 @@ repository. Include the Codex version, tmux version, terminal width/height, the
 rendered prompt structure, and whether copy mode was active. Do not include
 credentials, request contents, or other private pane output.
 
-The supported surface for v0.2.7 is Linux, Python 3.10+, an English Codex UI,
+The supported surface for v0.2.8 is Linux, Python 3.10+, an English Codex UI,
 and the npm `@openai/codex` native binary layout. Unsupported environments fail
 closed or are ignored.
 
@@ -23,6 +23,7 @@ configurations during upgrade.
 Cybersecurity notices are actionable only when every logical line, glyph,
 sentence, indentation level, and official URL matches the supported Codex UI
 block. Header-only, quoted, indented, or altered copies fail closed.
-Submitting `Continue` does not bypass Codex/OpenAI safety controls or grant
-Trusted Access; a repeated refusal can cause another retry until the watcher is
-disabled.
+429 retry-limit recovery uses a bounded backoff and resets only after a
+different Codex event; it does not retry in a tight loop. Submitting `Continue`
+does not bypass Codex/OpenAI safety controls or grant Trusted Access; a repeated
+refusal can cause another retry until the watcher is disabled.

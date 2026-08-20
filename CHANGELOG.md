@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.2.8 - 2026-08-19
+
+- Recognize Codex's `exceeded retry limit, last status: 429 Too Many Requests`
+  terminal state.
+- Recover the active pane after a bounded 1/2/5/10/15 minute backoff sequence,
+  resetting the delay after a different Codex event to avoid a tight retry loop.
+- Add self-test and isolated tmux integration coverage for strict matching,
+  quoted-lookalike rejection, delayed recovery, the trailing `Goal active`
+  status cell, pane-mode deferral, and backoff reset.
+
 ## v0.2.7 - 2026-07-30
 
 - Recognize strict overload and request-failure notices emitted while a remote
